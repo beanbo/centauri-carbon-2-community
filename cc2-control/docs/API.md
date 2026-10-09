@@ -168,6 +168,10 @@ request body, so a browser receives the error instead of a reset connection.
 filename, Canvas mapping, plate side and leveling mode: `1` enables timelapse for this print,
 `0` disables it. Omission defaults to `0`; other values are rejected with 400.
 The print popup exposes this selection for each job, initially unchecked.
+Two more optional fields follow: a measurement of the mounted plate to print on (empty for the side's
+saved mesh) and the installed nozzle (empty to keep it). A chosen nozzle is selected and its offset applied
+before the start; a measurement that is neither the side slot nor stored in the printer, or a plate that is
+not mounted on that side, is refused with 409. Calibrated starts ignore the measurement.
 
 Saved-mesh starts include the flag as native method 1020 `config.delay_video`.
 Calibrated starts first send method 1019 with `params.config.delay_video` and a unique request ID.
@@ -225,7 +229,10 @@ coefficients has not been independently verified.
 ## Build-plate library
 
 CC2 Control keeps named plate surfaces in `bed-plates.json` (`--plates FILE`, next to the UI preferences):
-each one has a side, the 11 × 11 mesh the printer measured for it and a Z offset of up to ±1 mm.
+each one has a side, a Z offset of up to ±1 mm and the 11 × 11 meshes the printer measured on it, one per
+bed temperature (40–110 °C) and nozzle, 20 in all. The file also lists up to 8 nozzles, each with a diameter
+and a Z correction of up to ±0.5 mm, and which one is installed. A version 1 file (one mesh per plate) is
+rewritten once as version 2 with each mesh as a 60 °C measurement, the temperature the firmware calibrates at.
 Printer facts this relies on, read from the V4.2 firmware and its logs:
 
 - Every print loads the mesh of its side: Side A uses profile `default`, Side B `default1` (`G180 S7`).
@@ -238,24 +245,54 @@ Printer facts this relies on, read from the V4.2 firmware and its logs:
   keeps the value last set with `SET_GCODE_OFFSET Z=…`. A restart clears it. The plate Z offset is that value.
 - The touchscreen's Z offset setting keeps its own value, 0 when the screen program starts, and sends it with
   `SET_GCODE_OFFSET Z=… MOVE=1`; it never reads the printer's offset, so a press there replaces the plate value.
+- `BED_MESH_CALIBRATE … BED_TEMP=t` heats the bed to `t` (`M140`/`M190`) before probing.
+- `BED_MESH_PROFILE SAVE=<name>` stores the active mesh under any other name and writes `autosave.cfg` at
+  once, without a restart, and `BED_MESH_PROFILE LOAD=<name>` makes a stored profile the active mesh.
+  The firmware runs a command received over its socket between the lines of a running print file.
+- The applied Z offset is the plate's plus the installed nozzle's correction. With load-cell probing the
+  nozzle is the probe, so the bed shape does not depend on it and every nozzle uses the same mesh.
+
+Each measurement is also kept in the printer as its own profile, `cc2_<measurement id>`: when it is
+created (the slot holds it, so CC2 Control sends `BED_MESH_PROFILE LOAD=<slot>` and `SAVE=cc2_<id>` and reads
+the file back), when its plate is mounted in place, and before a calibration or a restart replaces the slot
+that holds it. A print started from CC2 Control on the saved mesh may choose a measurement of the mounted
+plate. When it is not the side's slot, CC2 Control watches the print start through `bed_mesh.profile_name`
+in its telemetry subscription: whenever the printer has loaded the side slot (before the file and again at
+`G180 S7`) and the first layer has not begun, it sends `BED_MESH_PROFILE LOAD=cc2_<id>` (at most eight
+times per print). A load that comes too late leaves the side mesh in use and is reported as `missed`; an
+adaptive mesh (`ADAPTIVE`) is never replaced. Requires printer validation.
 
 Endpoints (all changes are `POST` with a text body, one field per line, and need `X-CC2-Request: 1`):
 
-- `GET /api/plates` returns the library, which plate is mounted, whether its Z offset has been applied, a
-  mount waiting for the printer restart, the last mount result (`mounted`, `verify_failed`,
-  `reboot_failed`) and, per plate, whether its mesh is the one now saved for its side (`in_printer`).
-- `/api/plates/save` (`A|B`, name, Z) stores the mesh the printer keeps for that side as a new plate. The
-  slot in `autosave.cfg` and in printer memory must agree.
-- `/api/plates/mount` (id) mounts a plate whose mesh is already in its slot and applies its Z offset with
-  `SET_GCODE_OFFSET Z=` (no movement). Any other plate answers 409 with `"reboot_required": true`; sending
-  the id and a second line `REBOOT` writes the slot (the previous file becomes `autosave_backup.cfg`, a copy
+- `GET /api/plates` returns the library, which plate is mounted, whether its Z offset has been applied
+  (`z_applied`) and the value applied with the installed nozzle (`z_effective`), a mount waiting for the
+  printer restart, the last mount result (`mounted`, `verify_failed`, `reboot_failed`), the printer's active
+  mesh (`mesh_profile`), the measurement watched for the latest print (`print_mesh`: `state` `waiting`,
+  `active` or `off`, `result` `loaded`, `missed`, `adaptive`, `failed`, `not_started` or `ended`) and the
+  nozzles. Per plate it tells whether the measurement it mounts with (`measure`) is the one now saved for
+  its side (`in_printer`); per measurement its temperature, nozzle, date, mesh and whether it is the side
+  slot (`slot`) or stored in the printer as its own profile (`profile`).
+- `/api/plates/save` (`A|B`, name, Z, temperature, nozzle; the last two optional, 60 °C and none) stores the
+  mesh the printer keeps for that side as a new plate with that measurement. The slot in `autosave.cfg` and
+  in printer memory must agree.
+- `/api/plates/measure` (plate, temperature, nozzle) after a calibration on that plate: the side slot becomes
+  its measurement at that temperature (replacing one with the same temperature and nozzle), the one it
+  mounts with, and the plate is mounted in place. `/api/plates/recapture` (id) does the same for the mounted
+  plate with the temperature and nozzle of its current measurement. `/api/plates/measure/delete` (id) removes
+  a measurement and its printer profile; a plate keeps at least one. `/api/plates/keep` (`A|B`) stores the
+  printer profile of the measurement the side slot holds; the UI sends it before a calibration.
+- `/api/plates/mount` (id, optionally a measurement id) mounts a plate whose measurement is already in its
+  slot and applies its Z offset with `SET_GCODE_OFFSET Z=` (no movement). Any other answers 409 with
+  `"reboot_required": true`; adding a line `REBOOT` writes the slot (the previous file becomes `autosave_backup.cfg`, a copy
   is kept as `bed-plates.json.autosave.bak`) and reboots the printer. The next CC2 Control process checks the
   slot in the file and in printer memory before it reports the plate mounted. If the reboot cannot be
   started, the previous mesh section is restored while unrelated configuration changes are preserved.
 - `/api/plates/edit` (id, name, Z) renames a plate or changes its Z offset; the mounted plate's new offset is
   applied at once when the printer is idle.
-- `/api/plates/recapture` (id) gives the mounted plate the mesh now saved for its side, after a new
-  calibration. `/api/plates/delete` (id) and `/api/plates/unmount` change only the library.
+- `/api/plates/nozzle` (id or empty for a new one, name, diameter, Z correction), `/api/plates/nozzle/delete`
+  (id) and `/api/plates/nozzle/select` (id or empty) manage the nozzles; a new correction of the installed
+  nozzle is applied at once when the printer is idle. `/api/plates/delete` (id) also removes the plate's
+  printer profiles; `/api/plates/unmount` changes only the library.
 
 Changes that touch the printer require a connected, registered, idle printer with fresh MQTT and printer
 service telemetry, no command or file transfer of CC2 Control in progress and no pending restart. The mounted
@@ -274,7 +311,7 @@ idle status received within 15 seconds, fresh UDS telemetry, and no active conso
 upload, download, or pending Z adjustment.
 
 Automatic post-restart verification and Z restoration use nonblocking UDS exchanges
-with a two-second deadline and a 64 KiB reply limit. Failed exchanges retry after five
+with a two-second deadline and a 128 KiB reply limit (every stored profile is part of the reply). Failed exchanges retry after five
 and fifteen seconds, then stop after three failures until the plate selection/value
 or the printer service changes. A reconnect to the same service does not reset this
 budget. A failed pending mount is cleared and must be mounted again explicitly. Conflicting manual commands and print starts return 409 while an exchange
@@ -358,7 +395,9 @@ Texts are UTF-8 without quotes, backslashes or control characters (name, brand a
 material up to 32). The file is replaced atomically after each change, and while printing at most every two
 minutes (sooner after 5 g); a file that cannot be read keeps the library closed rather than being
 overwritten. `POST /api/gcode-files/inspect` adds each tool's slicer length (`mm`) when the file states
-`; filament used [mm] = …`, so the print dialog can compare it with the spool the tool would draw from.
+`; filament used [mm] = …`, so the print dialog can compare it with the spool the tool would draw from. It
+also reports `bed_temperature` (the first `M190`/`M140` with a target) and `nozzle_diameter` (from the
+slicer's configuration block), or `null`, for the build-plate measurement and nozzle the dialog suggests.
 Requires printer validation.
 
 ## Bounded asynchronous G-code analysis
