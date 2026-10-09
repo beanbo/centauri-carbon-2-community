@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 import { Card, CardHead, Page } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Dot, Tag } from '@/components/ui/badge'
-import { Select } from '@/components/ui/field'
+import { Input, Select } from '@/components/ui/field'
 import { Tabs } from '@/components/ui/tabs'
 import { Icon } from '@/components/icons'
 import { Notice } from '@/components/shared'
@@ -17,9 +17,20 @@ import { defaultCam, drawMesh, meshStats, type Cam } from '@/lib/meshdraw'
 import { microns, screwPlan, screwValues } from '@/lib/screws'
 import { poll, usePoll } from '@/lib/poll'
 import { type BedTab, printer, nav, openPage, refreshConsole, screwText } from '@/lib/state'
-import { meshProfile, platePoints, plates, refreshPlates } from '@/lib/plates'
+import {
+  findMeasure,
+  keepSlot,
+  measurePlate,
+  meshProfile,
+  nozzleName,
+  plateBase,
+  platePoints,
+  plates,
+  refreshPlates,
+  tempOk,
+} from '@/lib/plates'
 import { sendConsole } from '@/pages/console'
-import { Plates } from '@/pages/bed-plates'
+import { NozzleSelect, Plates } from '@/pages/bed-plates'
 
 const I = { size: 16, strokeWidth: 1 }
 const PROFILES: [string, Key][] = [
@@ -34,11 +45,15 @@ const MeshCard = () => {
   const { profile } = meshProfile.use()
   const setProfile = (value: string) => meshProfile.set({ profile: value })
   const library = plates.use().data
-  const plate = profile.startsWith('plate:') ? library?.plates.find(p => `plate:${p.id}` === profile) : undefined
-  // A deleted plate falls back to the printer's active mesh.
+  const found = profile.startsWith('measure:') ? findMeasure(library, profile.slice(8)) : null
+  // A deleted measurement falls back to the printer's active mesh; an older `plate:` choice shows the plate's mesh.
   useEffect(() => {
-    if (library && profile.startsWith('plate:') && !plate) setProfile('active')
-  }, [library, profile, plate])
+    if (!library) return
+    if (profile.startsWith('plate:')) {
+      const p = library.plates.find(x => `plate:${x.id}` === profile)
+      setProfile(p ? `measure:${plateBase(p).id}` : 'active')
+    } else if (profile.startsWith('measure:') && !found) setProfile('active')
+  }, [library, profile, found])
   const [view, setView] = useState<View>('3d')
   const [scale, setScale] = useState(1)
   const cam = useRef<Cam>(defaultCam())
@@ -47,10 +62,12 @@ const MeshCard = () => {
   const queued = useRef(false)
   const alive = useRef(true)
   const points: Pt[] = useMemo(
-    () => (plate ? platePoints(plate.mesh) : (data && matrixFromUds(data, profile)) || []),
-    [data, profile, plate]
+    () => (found ? platePoints(found.measure.mesh) : (data && matrixFromUds(data, profile)) || []),
+    [data, profile, found]
   )
-  const shown = plate ? tpl('plates.plate_option', { name: plate.name }) : `${t('bed.saved_profile')} · ${profile}`
+  const shown = found
+    ? tpl('plates.measure_option', { name: found.plate.name, temp: found.measure.temp })
+    : `${t('bed.saved_profile')} · ${profile}`
   const xs = [...new Set(points.map(p => p.x))].sort((a, b) => a - b)
   const ys = [...new Set(points.map(p => p.y))].sort((a, b) => b - a)
   const cells = new Map(points.map(p => [`${p.x},${p.y}`, p.z]))
@@ -167,15 +184,15 @@ const MeshCard = () => {
                 {t(l)}
               </option>
             ))}
-            {!!library?.plates.length && (
-              <optgroup label={t('bed.build_plates')}>
-                {library.plates.map(p => (
-                  <option key={p.id} value={`plate:${p.id}`}>
-                    {tpl('plates.plate_option', { name: p.name })}
+            {library?.plates.map(p => (
+              <optgroup key={p.id} label={tpl('plates.plate_option', { name: p.name })}>
+                {p.measures.map(m => (
+                  <option key={m.id} value={`measure:${m.id}`}>
+                    {[`${m.temp} °C`, nozzleName(library, m.nozzle)].filter(Boolean).join(' · ')}
                   </option>
                 ))}
               </optgroup>
-            )}
+            ))}
           </Select>
         </label>
         <div class="flex">
@@ -296,7 +313,7 @@ const MeshCard = () => {
           points.length
             ? profile === 'active'
               ? `${t('bed.active_mesh_loaded')}${root?.profile_name ? ` · ${root.profile_name}` : ''}.`
-              : plate
+              : found
                 ? `${shown}.`
                 : `${t('bed.saved_mesh_loaded')} · ${profile}.`
             : t('bed.waiting_for_the_printer_mesh')
@@ -311,6 +328,18 @@ const homedXYZ = (axes: unknown) => typeof axes === 'string' && ['x', 'y', 'z'].
 
 const MeshActions = ({ reload, note }: { reload: () => void; note: string }) => {
   const [side, setSide] = useState('')
+  const [temp, setTemp] = useState('60')
+  const [nozzle, setNozzle] = useState<string | null>(null)
+  // The plate the result is saved to: null follows the mounted plate of that side, '' saves to none.
+  const [target, setTarget] = useState<string | null>(null)
+  const library = plates.use().data
+  const plateSide = side === 'default1' ? 'B' : side === 'default' ? 'A' : null
+  const candidates = library?.available ? library.plates.filter(p => p.side === plateSide) : []
+  const plateId =
+    target !== null && (target === '' || candidates.some(p => p.id === target))
+      ? target
+      : candidates.find(p => p.id === library?.current)?.id || ''
+  const nozzleId = nozzle ?? library?.nozzle ?? ''
   const [calibrating, setCalibrating] = useState(false)
   const lock = useRef(false)
   const cancelWatch = useRef(() => {})
@@ -354,17 +383,54 @@ const MeshActions = ({ reload, note }: { reload: () => void; note: string }) => 
   }
   return (
     <>
-      <label class="mt-3 flex items-center gap-2 text-xs">
-        {t('bed.calibration_plate_side')}
-        <Select value={side} disabled={calibrating} onChange={e => setSide(e.currentTarget.value)}>
-          <option value="">{t('bed.choose_calibration_side')}</option>
-          {PROFILES.slice(0, 2).map(([profile, label]) => (
-            <option key={profile} value={profile}>
-              {t(label)}
-            </option>
-          ))}
-        </Select>
-      </label>
+      <div class="mt-3 grid gap-2 text-xs cc2-sm:grid-cols-2 cc2-lg:grid-cols-[1.3fr_8rem_1fr_1.3fr]">
+        <label class="grid gap-1">
+          {t('bed.calibration_plate_side')}
+          <Select value={side} disabled={calibrating} onChange={e => setSide(e.currentTarget.value)}>
+            <option value="">{t('bed.choose_calibration_side')}</option>
+            {PROFILES.slice(0, 2).map(([profile, label]) => (
+              <option key={profile} value={profile}>
+                {t(label)}
+              </option>
+            ))}
+          </Select>
+        </label>
+        <label class="grid gap-1">
+          {t('common.bed_temperature_c')}
+          <Input
+            type="number"
+            min="40"
+            max="110"
+            step="1"
+            value={temp}
+            disabled={calibrating}
+            onInput={e => setTemp(e.currentTarget.value)}
+          />
+        </label>
+        {library && (
+          <label class="grid gap-1">
+            {t('common.nozzle')}
+            <NozzleSelect lib={library} value={nozzleId} disabled={calibrating} onChange={setNozzle} />
+          </label>
+        )}
+        {library?.available && (
+          <label class="grid gap-1">
+            {t('bed.calibration_plate')}
+            <Select
+              value={plateId}
+              disabled={calibrating || !plateSide}
+              onChange={e => setTarget(e.currentTarget.value)}
+            >
+              <option value="">{t('bed.no_plate')}</option>
+              {candidates.map(p => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </Select>
+          </label>
+        )}
+      </div>
       <div class="cc2-mesh-actions mt-3 grid gap-3 cc2-sm:grid-cols-[1fr_1.15fr]">
         {[
           ['folder', 'bed.load_current_mesh', 'bed.read_the_saved_mesh_from_printer', reload, false],
@@ -373,14 +439,23 @@ const MeshActions = ({ reload, note }: { reload: () => void; note: string }) => 
             'bed.run_bed_mesh_calibration',
             'bed.start_a_protected_calibration_when',
             async () => {
-              if (!side || lock.current) return
+              if (!side || !plateSide || lock.current) return
+              if (!tempOk(temp)) return notify(t('common.invalid_bed_temperature'), 'error')
               lock.current = true
               setCalibrating(true)
               try {
-                const label = t(side === 'default1' ? 'bed.side_b_default1' : 'bed.side_a_default')
+                const degrees = Number(temp)
+                const plate = candidates.find(p => p.id === plateId)
+                const lines = [t(side === 'default1' ? 'bed.side_b_default1' : 'bed.side_a_default')]
+                const nozzleLabel = nozzleName(library, nozzleId)
+                if (nozzleLabel) lines.push(tpl('bed.calibration_uses_nozzle', { name: nozzleLabel }))
+                if (plate) lines.push(tpl('bed.calibration_saves_to', { name: plate.name, temp: degrees }))
                 const home = !homedXYZ(printer.get().data?.motion?.homed_axes)
                 const homing = home ? `\n\n${t('bed.calibration_homes_first')}` : ''
-                if (!(await ask(`${t('bed.start_a_new_bed_mesh_calibration')}\n\n${label}${homing}`))) return
+                const question = tpl('bed.start_a_new_bed_mesh_calibration', { temp: degrees })
+                if (!(await ask(`${question}\n\n${lines.join('\n')}${homing}`))) return
+                // The measurement the side mesh holds keeps a printer profile before the calibration replaces it.
+                if (library?.available) await keepSlot(plateSide).catch(() => {})
                 if (home) {
                   if (!(await sendConsole('G28'))) return
                   if (
@@ -391,10 +466,20 @@ const MeshActions = ({ reload, note }: { reload: () => void; note: string }) => 
                     return
                   }
                 }
-                const command = `BED_MESH_CALIBRATE PROFILE=${side} BED_TEMP=60`
+                const command = `BED_MESH_CALIBRATE PROFILE=${side} BED_TEMP=${degrees}`
                 if (!(await sendConsole(command))) return
                 // Poll only the local console status while calibration is running, then fetch the new mesh once.
-                if (await waitFor(consoleDone(command), 15 * 60_000, 2500)) reload()
+                if (!(await waitFor(consoleDone(command), 25 * 60_000, 2500))) return
+                reload()
+                if (plate) {
+                  try {
+                    await measurePlate(plate.id, degrees, nozzleId)
+                    notify(tpl('bed.measure_saved', { name: plate.name, temp: degrees }))
+                  } catch (e) {
+                    notify(tpl('bed.measure_not_saved', { error: errText(e) }), 'error')
+                  }
+                  void refreshPlates()
+                }
               } finally {
                 lock.current = false
                 setCalibrating(false)
