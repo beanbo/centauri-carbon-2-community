@@ -142,6 +142,15 @@ try {
   assert.deepEqual(posts.at(-1), ['/api/plates/measure/delete', 'aa00000000000100'])
   await row('Smooth PEI', 100).waitFor({ state: 'detached' })
   assert.equal(await row('Cool Plate', 60).getByRole('button', { name: 'Delete', exact: true }).count(), 0)
+  // What a measurement records can be corrected: an old one gets its nozzle and temperature.
+  await row('Cool Plate', 60).getByRole('button', { name: 'Edit measurement', exact: true }).click()
+  const editRow = card('Cool Plate').locator('[data-measure]').first()
+  await editRow.locator('input[type=number]').fill('65')
+  await editRow.locator('select').selectOption('dd00000000000006')
+  await editRow.getByRole('button', { name: 'Save', exact: true }).click()
+  await toast('Measurement updated.')
+  assert.deepEqual(posts.at(-1), ['/api/plates/measure/edit', 'cc00000000000060|65|dd00000000000006'.split('|').join(String.fromCharCode(10))])
+  await row('Cool Plate', 65).getByText('0.6 hardened', { exact: true }).waitFor()
 
   // A new plate from the Side B mesh, with its bed temperature and nozzle; a name the backend refuses never leaves the page.
   const form = page.locator('section').filter({ has: page.getByRole('heading', { name: 'Save Printer Mesh as a Plate' }) })

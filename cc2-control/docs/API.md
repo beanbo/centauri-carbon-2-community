@@ -279,8 +279,22 @@ Endpoints (all changes are `POST` with a text body, one field per line, and need
   its measurement at that temperature (replacing one with the same temperature and nozzle), the one it
   mounts with, and the plate is mounted in place. `/api/plates/recapture` (id) does the same for the mounted
   plate with the temperature and nozzle of its current measurement. `/api/plates/measure/delete` (id) removes
-  a measurement and its printer profile; a plate keeps at least one. `/api/plates/keep` (`A|B`) stores the
-  printer profile of the measurement the side slot holds; the UI sends it before a calibration.
+  a measurement and its printer profile; a plate keeps at least one. `/api/plates/measure/edit` (id,
+  temperature, nozzle) corrects what a measurement records, e.g. the nozzle of one made before nozzles were
+  listed; two measurements of a plate cannot share temperature and nozzle. `/api/plates/keep` (`A|B`) stores
+  the printer profile of the measurement the side slot holds.
+- `/api/plates/calibrate` (`A|B`, temperature, soak minutes 0–60, nozzle, plate; the last two may be empty)
+  runs a bed mesh calibration on CC2 Control, so no page has to stay open: it keeps the slot's measurement as
+  a profile, homes the printer when needed (`G28`), heats the bed (`M140`), waits until telemetry reads the
+  temperature, holds it for the soak time (the firmware's own calibration probes as soon as the sensor
+  reads the target, while the plate still expands), then sends `BED_MESH_CALIBRATE PROFILE=<slot>
+  BED_TEMP=<t>` through the console. With a plate, the result becomes its measurement as with
+  `/api/plates/measure`. `GET /api/plates` reports it as `calibration` (`stage` `homing`, `heating`,
+  `soaking`, `probing`, `saving` or `off`, the soak seconds `remaining`, the bed temperature `bed`, and
+  `result` `done`, `saved`, `failed` or `cancelled` with `error` `homing`, `heating`, `busy`, `probing` or
+  `saving`). `/api/plates/calibrate/cancel` stops it and switches the bed heater off until the probing
+  starts. Print starts and plate changes are refused while it runs; a print started meanwhile, or a changed
+  bed target, ends it.
 - `/api/plates/mount` (id, optionally a measurement id) mounts a plate whose measurement is already in its
   slot and applies its Z offset with `SET_GCODE_OFFSET Z=` (no movement). Any other answers 409 with
   `"reboot_required": true`; adding a line `REBOOT` writes the slot (the previous file becomes `autosave_backup.cfg`, a copy

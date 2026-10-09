@@ -5,7 +5,7 @@ checksums remain attached to each GitHub release.
 
 ## Unreleased
 
-- Bed mesh calibration takes a bed temperature (40–110 °C, 60 by default) and a nozzle, and can save the result to a build plate. A plate keeps one measurement per temperature and nozzle; a print started from CC2 Control uses the one nearest to the file's bed temperature (or the one chosen in the print dialog), loaded during the print start without a restart. A nozzle list adds each nozzle's Z correction to the plate's Z offset, so one mesh serves every nozzle.
+- Bed mesh calibration takes a bed temperature (40–110 °C, 60 by default), a soak time (10 minutes by default; the firmware itself probes as soon as the bed reads the temperature) and a nozzle, and can save the result to a build plate. It runs on CC2 Control, so the page may be closed, and can be stopped until the probing starts. A plate keeps one measurement per temperature and nozzle; a print started from CC2 Control uses the one nearest to the file's bed temperature (or the one chosen in the print dialog), loaded during the print start without a restart. A nozzle list adds each nozzle's Z correction to the plate's Z offset, so one mesh serves every nozzle; a measurement's temperature and nozzle can be corrected later.
 
 ## Community Firmware V4.3 / CC2 Control 1.2.0 — pre-release, 2026-10-09
 

@@ -41,6 +41,22 @@ export type PrintMesh = {
   measure: string
   result: '' | 'loaded' | 'missed' | 'adaptive' | 'failed' | 'not_started' | 'ended'
 }
+// A bed mesh calibration CC2 Control runs: homing, heating, holding the bed at the temperature, probing and
+// saving to a plate. `remaining` counts the soak in seconds; `bed` is the bed temperature now.
+export type Calibration = {
+  stage: 'off' | 'homing' | 'heating' | 'soaking' | 'probing' | 'saving'
+  side: 'A' | 'B'
+  temp: number
+  soak: number
+  remaining: number
+  bed: number | null
+  plate: string
+  nozzle: string
+  measure: string
+  result: '' | 'done' | 'saved' | 'failed' | 'cancelled'
+  error: '' | 'homing' | 'heating' | 'busy' | 'probing' | 'saving'
+  detail: string
+}
 export type PlateLibrary = {
   available: boolean
   error: string
@@ -52,6 +68,7 @@ export type PlateLibrary = {
   nozzle: string
   mesh_profile: string | null
   print_mesh: PrintMesh
+  calibration: Calibration
   slots: { A: string; B: string }
   nozzles: Nozzle[]
   plates: Plate[]
@@ -145,8 +162,13 @@ export const mountPlate = (id: string, reboot = false, measure = '') =>
 export const measurePlate = (id: string, temp: number, nozzle: string) =>
   post('/api/plates/measure', `${id}\n${temp}\n${nozzle}`)
 export const deleteMeasure = (id: string) => post('/api/plates/measure/delete', id)
-// Before a calibration replaces a side mesh, its measurement gets a printer profile.
-export const keepSlot = (side: 'A' | 'B') => post('/api/plates/keep', side)
+// Corrects the temperature and nozzle a measurement records.
+export const editMeasure = (id: string, temp: number, nozzle: string) =>
+  post('/api/plates/measure/edit', `${id}\n${temp}\n${nozzle}`)
+// Runs on the printer without the page: `plate` (or '') receives the result.
+export const calibrate = (side: 'A' | 'B', temp: number, soak: number, nozzle: string, plate: string) =>
+  post('/api/plates/calibrate', `${side}\n${temp}\n${soak}\n${nozzle}\n${plate}`)
+export const stopCalibration = () => post('/api/plates/calibrate/cancel')
 export const saveNozzle = (id: string, name: string, diameter: number, z: number) =>
   post('/api/plates/nozzle', `${id}\n${name}\n${diameter.toFixed(2)}\n${z.toFixed(3)}`)
 export const deleteNozzle = (id: string) => post('/api/plates/nozzle/delete', id)

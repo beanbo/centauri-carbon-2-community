@@ -11,6 +11,7 @@ import { usePoll } from '@/lib/poll'
 import {
   deleteMeasure,
   deleteNozzle,
+  editMeasure,
   deletePlate,
   editPlate,
   findMeasure,
@@ -124,12 +125,53 @@ const MeasureRow = ({
   act: Act
 }) => {
   const idleOnly = idle ? undefined : t('common.available_when_idle')
+  // What the measurement records can be corrected, e.g. the nozzle of one made before nozzles were listed.
+  const [editing, setEditing] = useState(false)
+  const [temp, setTemp] = useState(String(m.temp))
+  const [nozzle, setNozzle] = useState(m.nozzle)
   const remove = () =>
     act(async () => {
       if (!(await ask(tpl('plates.delete_measure_confirm', { name: p.name, temp: m.temp }), true))) return
       await deleteMeasure(m.id)
       notify(t('plates.measure_deleted'))
     })
+  const save = () =>
+    act(async () => {
+      if (!tempOk(temp)) return notify(t('common.invalid_bed_temperature'), 'error')
+      await editMeasure(m.id, Number(temp), nozzle)
+      setEditing(false)
+      notify(t('plates.measure_updated'))
+    })
+  if (editing)
+    return (
+      <div
+        class="flex flex-wrap items-end gap-2 rounded-md border border-cyan px-2.5 py-1.5 text-xs"
+        data-measure={m.id}
+      >
+        <label class="grid gap-1">
+          {t('common.bed_temperature_c')}
+          <Input
+            class="w-24"
+            type="number"
+            min="40"
+            max="110"
+            step="1"
+            value={temp}
+            onInput={e => setTemp(e.currentTarget.value)}
+          />
+        </label>
+        <label class="grid min-w-40 flex-1 gap-1">
+          {t('common.nozzle')}
+          <NozzleSelect lib={lib} value={nozzle} onChange={setNozzle} />
+        </label>
+        <Button variant="primary" class="min-h-9 px-3 text-xs" disabled={locked} onClick={save}>
+          {t('plates.save')}
+        </Button>
+        <Button class="min-h-9 px-3 text-xs" onClick={() => setEditing(false)}>
+          {t('common.cancel')}
+        </Button>
+      </div>
+    )
   return (
     <div
       class="flex flex-wrap items-center gap-x-3 gap-y-1.5 rounded-md border border-edge px-2.5 py-1.5 text-xs"
@@ -157,6 +199,17 @@ const MeasureRow = ({
           }}
         >
           {t('plates.view_mesh')}
+        </Button>
+        <Button
+          class="min-h-7 px-2 text-xs"
+          disabled={locked}
+          onClick={() => {
+            setTemp(String(m.temp))
+            setNozzle(m.nozzle)
+            setEditing(true)
+          }}
+        >
+          {t('plates.edit_measure')}
         </Button>
         {!m.slot && (
           <Button
