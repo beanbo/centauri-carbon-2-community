@@ -98,6 +98,20 @@ static long long plates_next_tick_ms;
 /* Tests replace the printer round trip. */
 static int (*plates_uds)(const char *query, char **reply, size_t *length) = uds_query_json;
 
+/* A bed mesh calibration run by CC2 Control, see plates_calibration_tick. */
+enum { CAL_IDLE, CAL_HOMING, CAL_HEATING, CAL_SOAKING, CAL_PROBING, CAL_SAVING };
+#define PLATE_SOAK_MAX 60 /* minutes */
+static struct {
+    int stage, temp, soak; /* soak in seconds */
+    char side;
+    char plate[PLATE_ID_LEN + 1], nozzle[PLATE_ID_LEN + 1], measure[PLATE_ID_LEN + 1];
+    long long since, soak_until, done_at; /* stage start, end of the soak, when the console command finished */
+    unsigned long generation; /* the console command the stage waits for */
+    const char *result; /* "", "done" (no plate), "saved", "failed" or "cancelled" */
+    const char *error;  /* what failed: "homing", "heating", "busy", "probing" or "saving" */
+    char detail[160];
+} plates_cal = {.result = "", .error = ""};
+
 static const char *plate_slot(char side) { return side == 'B' ? "default1" : "default"; }
 
 static plate_entry *plate_find(const char *id) {
@@ -920,6 +934,7 @@ static const char *plates_printer_ready(const mqtt_client *mqtt) {
     if (reboot_pending || plates_reboot_requested) return "A printer restart is already pending";
     if (plates_console_busy()) return "Another printer command is still running";
     if (atomic_load(&upload_busy) || atomic_load(&active_downloads)) return "A file transfer is in progress";
+    if (plates_cal.stage && plates_cal.stage != CAL_SAVING) return "A bed mesh calibration is running";
     return NULL;
 }
 
@@ -992,6 +1007,16 @@ static void plates_get_response(int fd) {
     else json_builder_printf(&b, "\"z_effective\":null,");
     json_builder_printf(&b, "\"nozzle\":\"%s\",\"mesh_profile\":", plates.nozzle);
     if (active) json_builder_string(&b, active); else json_builder_printf(&b, "null");
+    static const char *stages[] = {"off", "homing", "heating", "soaking", "probing", "saving"};
+    double bed = 0; int have_bed = uds_value(&telemetry, U_BT, &bed);
+    long long left = plates_cal.stage == CAL_SOAKING ? (plates_cal.soak_until - monotonic_ms() + 999) / 1000 : 0;
+    json_builder_printf(&b, ",\"calibration\":{\"stage\":\"%s\",\"side\":\"%c\",\"temp\":%d,\"soak\":%d,"
+        "\"remaining\":%lld,\"plate\":\"%s\",\"nozzle\":\"%s\",\"measure\":\"%s\",\"result\":\"%s\","
+        "\"error\":\"%s\",\"detail\":", stages[plates_cal.stage], plates_cal.side ? plates_cal.side : 'A',
+        plates_cal.temp, plates_cal.soak, left > 0 ? left : 0, plates_cal.plate, plates_cal.nozzle,
+        plates_cal.measure, plates_cal.result, plates_cal.error);
+    json_builder_string(&b, plates_cal.detail);
+    if (have_bed) json_builder_printf(&b, ",\"bed\":%.1f}", bed); else json_builder_printf(&b, ",\"bed\":null}");
     json_builder_printf(&b, ",\"print_mesh\":{\"state\":\"%s\",\"measure\":\"%s\",\"result\":\"%s\"},"
         "\"slots\":{\"A\":\"%s\",\"B\":\"%s\"},\"nozzles\":[",
         plates_late.state == 1 ? "waiting" : plates_late.state == 2 ? "active" : "off", plates_late.measure,
@@ -1039,26 +1064,38 @@ static void plates_get_response(int fd) {
     free(b.data);
 }
 
-/* The slot mesh as the printer uses it: the file and printer memory must agree. */
-static int plates_capture(int fd, char side, plate_mesh *mesh) {
+/* The slot mesh as the printer uses it: the file and printer memory must agree.
+ * NULL, or why not with the HTTP status in *status. */
+static const char *plates_capture_mesh(char side, plate_mesh *mesh, int *status) {
     plate_mesh memory;
     int file = autosave_slot(side, mesh);
-    if (file < 0) { plates_fail(fd, 503, "Cannot read the printer mesh file"); return 0; }
-    if (!file) { plates_fail(fd, 409, "This side has no saved mesh; run a bed mesh calibration first"); return 0; }
+    *status = file < 0 ? 503 : 409;
+    if (file < 0) return "Cannot read the printer mesh file";
+    if (!file) return "This side has no saved mesh; run a bed mesh calibration first";
     int live = plates_memory_slot(side, &memory);
-    if (live < 0) { plates_fail(fd, 503, "Cannot read the printer mesh"); return 0; }
-    if (!live || !plate_mesh_equal(&memory, mesh, 0)) {
-        plates_fail(fd, 409, "The printer mesh in memory differs from the saved file; restart the printer first");
-        return 0;
-    }
-    return 1;
+    *status = live < 0 ? 503 : 409;
+    if (live < 0) return "Cannot read the printer mesh";
+    if (!live || !plate_mesh_equal(&memory, mesh, 0))
+        return "The printer mesh in memory differs from the saved file; restart the printer first";
+    return NULL;
+}
+static int plates_capture(int fd, char side, plate_mesh *mesh) {
+    int status; const char *error = plates_capture_mesh(side, mesh, &status);
+    if (error) plates_fail(fd, status, error);
+    return !error;
 }
 
+static const char *plates_closed(int *status) {
+    *status = 409;
+    if (plates_background_active()) return "Plate verification is still running";
+    if (!plates_available) { *status = 503; return plates_error; }
+    if (plates.pending[0]) return "A plate change is waiting for the printer restart";
+    return NULL;
+}
 static int plates_open(int fd) {
-    if (plates_background_active()) { plates_fail(fd,409,"Plate verification is still running");return 0; }
-    if (!plates_available) { plates_fail(fd, 503, plates_error); return 0; }
-    if (plates.pending[0]) { plates_fail(fd, 409, "A plate change is waiting for the printer restart"); return 0; }
-    return 1;
+    int status; const char *error = plates_closed(&status);
+    if (error) plates_fail(fd, status, error);
+    return !error;
 }
 
 static int plates_name_taken(const char *name, const plate_entry *except) {
@@ -1115,23 +1152,25 @@ static void plates_save_response(int fd, const mqtt_client *mqtt, const char *bo
  * at `temp` with `nozzle` (replacing the one with the same temperature and nozzle),
  * gets its printer profile and is what the plate mounts with. The plate was on the
  * bed, so it is mounted, in place. */
-static void plates_measure_into(int fd, const mqtt_client *mqtt, const char *id, int temp, const char *nozzle,
-                                int mounted_only) {
+static const char *plates_take_measure(const mqtt_client *mqtt, const char *id, int temp, const char *nozzle,
+                                       int mounted_only, int *status, plate_measure **out, int *profile, int *applied) {
     const char *reason;
-    if (!plates_open(fd)) return;
+    if ((reason = plates_closed(status))) return reason;
     plate_entry *p = plate_find(id);
-    if (!p) { plates_fail(fd, 404, "Unknown plate"); return; }
-    if (mounted_only && strcmp(plates.current, p->id)) { plates_fail(fd, 409, "Only the mounted plate can take the printer mesh"); return; }
+    *status = 404;
+    if (!p) return "Unknown plate";
+    *status = 409;
+    if (mounted_only && strcmp(plates.current, p->id)) return "Only the mounted plate can take the printer mesh";
     plate_measure *m = NULL;
     for (int i = 0; i < plates.measure_count && !m; ++i) {
         plate_measure *o = &plates.measures[i];
         if (!strcmp(o->plate, p->id) && o->temp == temp && !strcmp(o->nozzle, nozzle)) m = o;
     }
-    if (!m && plates.measure_count >= PLATE_MEASURES_MAX) { plates_fail(fd, 409, "The plate library has no room for another measurement"); return; }
-    if ((reason = plates_printer_ready(mqtt))) { plates_fail(fd, 409, reason); return; }
-    if (z_offset_pending) { plates_fail(fd, 409, "A Z offset change is still being confirmed"); return; }
+    if (!m && plates.measure_count >= PLATE_MEASURES_MAX) return "The plate library has no room for another measurement";
+    if ((reason = plates_printer_ready(mqtt))) return reason;
+    if (z_offset_pending) return "A Z offset change is still being confirmed";
     plate_mesh mesh;
-    if (!plates_capture(fd, p->side, &mesh)) return;
+    if ((reason = plates_capture_mesh(p->side, &mesh, status))) return reason;
     plates_begin();
     if (!m) {
         m = &plates.measures[plates.measure_count++];
@@ -1143,10 +1182,18 @@ static void plates_measure_into(int fd, const mqtt_client *mqtt, const char *id,
     m->mesh = mesh; m->measured = (long long)time(NULL);
     memcpy(p->measure, m->id, sizeof(p->measure));
     memcpy(plates.current, p->id, sizeof(plates.current));
-    if (!plates_commit(fd)) return;
+    if (plates_save() != 0) { plates = plates_undo; *status = 500; return "Cannot save the plate library"; }
     plates_result = "mounted";
-    int profile = plates_store_profile(p->side, m);
-    int applied = plates_apply_z(plate_z_now(p)) == 0;
+    *profile = plates_store_profile(p->side, m);
+    *applied = plates_apply_z(plate_z_now(p)) == 0;
+    *out = m;
+    return NULL;
+}
+static void plates_measure_into(int fd, const mqtt_client *mqtt, const char *id, int temp, const char *nozzle,
+                                int mounted_only) {
+    int status = 500, profile = 0, applied = 0; plate_measure *m = NULL;
+    const char *error = plates_take_measure(mqtt, id, temp, nozzle, mounted_only, &status, &m, &profile, &applied);
+    if (error) { plates_fail(fd, status, error); return; }
     char reply[160];
     snprintf(reply, sizeof(reply), "{\"saved\":true,\"measure\":\"%s\",\"profile\":%s,\"applied\":%s}\n",
              m->id, profile ? "true" : "false", applied ? "true" : "false");
@@ -1160,6 +1207,28 @@ static void plates_measure_response(int fd, const mqtt_client *mqtt, const char 
     if (count < 2 || !plate_id_valid(fields[0]) || !plate_temp_parse(fields[1], &temp) ||
         (count == 3 && !plate_nozzle_ref(fields[2]))) { plates_fail(fd, 400, "Invalid measurement"); return; }
     plates_measure_into(fd, mqtt, fields[0], temp, count == 3 ? fields[2] : "", 0);
+}
+
+/* id \n temp \n nozzle: corrects what a measurement records, e.g. the nozzle of one made before nozzles
+ * were listed. Its mesh and printer profile stay as they are. */
+static void plates_measure_edit_response(int fd, const char *body, size_t length) {
+    char fields[3][PLATE_NAME_MAX + 1] = {{0}}; int temp;
+    int count = plates_fields(body, length, fields, 3);
+    if (count < 2 || !plate_id_valid(fields[0]) || !plate_temp_parse(fields[1], &temp) ||
+        !plate_nozzle_ref(fields[2])) { plates_fail(fd, 400, "Invalid measurement"); return; }
+    if (!plates_open(fd)) return;
+    plate_measure *m = measure_find(fields[0]);
+    if (!m) { plates_fail(fd, 404, "Unknown measurement"); return; }
+    for (int i = 0; i < plates.measure_count; ++i) {
+        const plate_measure *o = &plates.measures[i];
+        if (o != m && !strcmp(o->plate, m->plate) && o->temp == temp && !strcmp(o->nozzle, fields[2])) {
+            plates_fail(fd, 409, "The plate already has a measurement at this temperature with this nozzle"); return;
+        }
+    }
+    plates_begin();
+    m->temp = temp; memcpy(m->nozzle, fields[2], sizeof(m->nozzle)); /* "" or a checked id */
+    if (!plates_commit(fd)) return;
+    plates_reply(fd, 200, "{\"saved\":true}\n");
 }
 
 /* id: the mounted plate's measurement takes the mesh the printer now keeps for its side, after a new calibration. */
@@ -1620,6 +1689,7 @@ static void plates_late_tick(void) {
 static const char *plates_print_prepare(const mqtt_client *mqtt, char side, int saved_mesh, const char *measure,
                                         const char *nozzle, char *late) {
     late[0] = 0;
+    if (plates_cal.stage) return "A bed mesh calibration is running";
     if (!*measure && !*nozzle) return NULL;
     if (!plates_available) return plates_error;
     if (plates.pending[0]) return "A plate change is waiting for the printer restart";
@@ -1664,6 +1734,158 @@ static void plates_print_arm(const char *late, char side) {
     snprintf(plates_late.slot, sizeof(plates_late.slot), "%s", plate_slot(side));
     plates_late.state = 1; plates_late.layer_reset = 0; plates_late.loads = 0;
     plates_late.armed = monotonic_ms(); plates_late.sent = 0;
+}
+
+/* ---- bed mesh calibration ---------------------------------------------------------- */
+
+/* The firmware's BED_MESH_CALIBRATE ... BED_TEMP=t heats the bed and probes as soon as
+ * the sensor reads t, while the plate is still expanding. Run here, the calibration
+ * first holds the bed at t for the chosen time. Every step goes through the console,
+ * like a command typed there; tests replace the console. */
+static int plates_console_send(console_state *console, const char *command) {
+    char reason[160];
+    return console_start(console, command, reason, sizeof(reason));
+}
+static int (*plates_console)(console_state *console, const char *command) = plates_console_send;
+
+static int plates_cal_command(console_state *console, int stage, const char *command) {
+    if (plates_console(console, command) != 0) return -1;
+    pthread_mutex_lock(&console->lock);
+    plates_cal.generation = console->generation;
+    pthread_mutex_unlock(&console->lock);
+    plates_cal.stage = stage; plates_cal.since = monotonic_ms(); plates_cal.done_at = 0;
+    return 0;
+}
+
+/* The bed heater is switched off when the job ends early while the printer is idle. */
+static void plates_cal_end(const char *result, const char *error, const char *detail, int bed_off) {
+    if (bed_off) (void)send_local_gcode_script("M140 S0");
+    if (plates_cal.stage) fprintf(stderr, "Bed mesh calibration at %d C: %s %s %s\n", plates_cal.temp, result, error, detail);
+    plates_cal.stage = CAL_IDLE; plates_cal.result = result; plates_cal.error = error;
+    snprintf(plates_cal.detail, sizeof(plates_cal.detail), "%s", detail);
+}
+
+static int plates_homed(const mqtt_client *mqtt) {
+    return strchr(mqtt->homed_axes, 'x') && strchr(mqtt->homed_axes, 'y') && strchr(mqtt->homed_axes, 'z');
+}
+
+/* side \n temp \n soak minutes [\n nozzle [\n plate]]: calibrate the side's mesh at `temp`.
+ * CC2 Control homes the printer when needed, heats the bed, holds it for the soak time
+ * and probes; with a plate the result becomes its measurement at `temp` with `nozzle`.
+ * It needs no open page; it can be cancelled until the probing starts. */
+static void plates_calibrate_response(int fd, const mqtt_client *mqtt, console_state *console, const char *body,
+                                      size_t length) {
+    char fields[5][PLATE_NAME_MAX + 1] = {{0}}; int temp, soak; const char *reason;
+    int count = plates_fields(body, length, fields, 5);
+    size_t n = strlen(fields[2]);
+    if (count < 3 || strlen(fields[0]) != 1 || (fields[0][0] != 'A' && fields[0][0] != 'B') ||
+        !plate_temp_parse(fields[1], &temp) || !n || n > 2 || strspn(fields[2], "0123456789") != n ||
+        (soak = atoi(fields[2])) > PLATE_SOAK_MAX || !plate_nozzle_ref(fields[3]) ||
+        (fields[4][0] && !plate_id_valid(fields[4]))) { plates_fail(fd, 400, "Invalid calibration"); return; }
+    if (plates_cal.stage) { plates_fail(fd, 409, "A bed mesh calibration is already running"); return; }
+    char side = fields[0][0];
+    if (fields[4][0]) {
+        if (!plates_open(fd)) return;
+        const plate_entry *p = plate_find(fields[4]);
+        if (!p) { plates_fail(fd, 404, "Unknown plate"); return; }
+        if (p->side != side) { plates_fail(fd, 409, "The plate is on the other side"); return; }
+    }
+    if ((reason = plates_printer_ready(mqtt))) { plates_fail(fd, 409, reason); return; }
+    if (z_offset_pending) { plates_fail(fd, 409, "A Z offset change is still being confirmed"); return; }
+    /* The measurement now in the slot keeps a printer profile before the calibration replaces it. */
+    if (plates_available && !plates.pending[0]) (void)plates_keep_slot(side);
+    memset(&plates_cal, 0, sizeof(plates_cal));
+    plates_cal.side = side; plates_cal.temp = temp; plates_cal.soak = soak * 60;
+    memcpy(plates_cal.nozzle, fields[3], sizeof(plates_cal.nozzle)); /* "" or a checked id */
+    memcpy(plates_cal.plate, fields[4], sizeof(plates_cal.plate));
+    plates_cal.result = ""; plates_cal.error = "";
+    char command[32];
+    snprintf(command, sizeof(command), "M140 S%d", temp);
+    if (plates_cal_command(console, plates_homed(mqtt) ? CAL_HEATING : CAL_HOMING,
+                           plates_homed(mqtt) ? command : "G28") != 0) {
+        plates_cal.stage = CAL_IDLE;
+        plates_fail(fd, 409, "Another printer command is still running"); return;
+    }
+    plates_reply(fd, 202, "{\"started\":true}\n");
+}
+
+/* Until the probing starts. */
+static void plates_calibrate_cancel_response(int fd) {
+    if (plates_cal.stage == CAL_PROBING || plates_cal.stage == CAL_SAVING) {
+        plates_fail(fd, 409, "The probing has started; use the emergency stop to interrupt it"); return;
+    }
+    if (plates_cal.stage) plates_cal_end("cancelled", "", "", 1);
+    plates_reply(fd, 200, "{\"cancelled\":true}\n");
+}
+
+static void plates_calibration_tick(const mqtt_client *mqtt, console_state *console) {
+    if (!plates_cal.stage) return;
+    long long now = monotonic_ms();
+    pthread_mutex_lock(&console->lock);
+    int ours = console->generation == plates_cal.generation, busy = console->busy;
+    int finished = ours && !busy && console->completed, success = console->success;
+    pthread_mutex_unlock(&console->lock);
+    if (finished && !plates_cal.done_at) plates_cal.done_at = now;
+    int idle = mqtt->have_machine_status && mqtt->machine_status == 1;
+    double bed = 0, target = 0;
+    int have_bed = uds_value(&telemetry, U_BT, &bed) && uds_value(&telemetry, U_BG, &target);
+    switch (plates_cal.stage) {
+    case CAL_HOMING:
+        if (finished && !success) { plates_cal_end("failed", "homing", "", 0); return; }
+        if (finished && plates_homed(mqtt) && !busy) {
+            char command[32]; snprintf(command, sizeof(command), "M140 S%d", plates_cal.temp);
+            if (plates_cal_command(console, CAL_HEATING, command) != 0 && now - plates_cal.done_at > 30000)
+                plates_cal_end("failed", "busy", "", 0);
+            return;
+        }
+        if ((finished && now - plates_cal.done_at > 30000) || now - plates_cal.since > 5 * 60000)
+            plates_cal_end("failed", "homing", "", 0);
+        return;
+    case CAL_HEATING:
+        if (finished && !success) { plates_cal_end("failed", "heating", "", 1); return; }
+        if (!finished) { if (now - plates_cal.since > 60000) plates_cal_end("failed", "heating", "", 1); return; }
+        if (!idle && mqtt->have_machine_status) { plates_cal_end("failed", "busy", "", 0); return; }
+        if (have_bed && fabs(target - plates_cal.temp) > 0.5 && now - plates_cal.done_at > 10000) {
+            plates_cal_end("failed", "heating", "The bed heater was changed", 0); return;
+        }
+        if (have_bed && fabs(target - plates_cal.temp) <= 0.5 && bed >= plates_cal.temp - 1.0) {
+            plates_cal.stage = CAL_SOAKING; plates_cal.since = now;
+            plates_cal.soak_until = now + (long long)plates_cal.soak * 1000;
+            return;
+        }
+        if (now - plates_cal.since > 30 * 60000) plates_cal_end("failed", "heating", "The bed did not reach the temperature", 1);
+        return;
+    case CAL_SOAKING:
+        if (!idle && mqtt->have_machine_status) { plates_cal_end("failed", "busy", "", 0); return; }
+        if (have_bed && fabs(target - plates_cal.temp) > 0.5) {
+            plates_cal_end("failed", "heating", "The bed heater was changed", 0); return;
+        }
+        if (now < plates_cal.soak_until || busy) return; /* a command typed meanwhile finishes first */
+        {
+            char command[96];
+            snprintf(command, sizeof(command), "BED_MESH_CALIBRATE PROFILE=%s BED_TEMP=%d", plate_slot(plates_cal.side),
+                     plates_cal.temp);
+            if (plates_cal_command(console, CAL_PROBING, command) != 0 && now - plates_cal.soak_until > 60000)
+                plates_cal_end("failed", "busy", "", 1);
+        }
+        return;
+    case CAL_PROBING:
+        if (!finished) return; /* the console gives up on a command after 15 minutes */
+        if (!success) { plates_cal_end("failed", "probing", "", 0); return; }
+        if (!plates_cal.plate[0]) { plates_cal_end("done", "", "", 0); return; }
+        plates_cal.stage = CAL_SAVING; plates_cal.since = now;
+        return;
+    case CAL_SAVING: {
+        int status = 0, profile = 0, applied = 0; plate_measure *m = NULL;
+        const char *error = plates_take_measure(mqtt, plates_cal.plate, plates_cal.temp, plates_cal.nozzle, 0,
+                                                &status, &m, &profile, &applied);
+        if (!error) {
+            memcpy(plates_cal.measure, m->id, sizeof(plates_cal.measure));
+            plates_cal_end("saved", "", profile ? "" : "The printer did not store the measurement profile", 0);
+        } else if (status != 409 || now - plates_cal.since > 60000) plates_cal_end("failed", "saving", error, 0);
+        return;
+    }
+    }
 }
 
 /* Main loop: undo a write whose restart failed, verify a mount after the restart,

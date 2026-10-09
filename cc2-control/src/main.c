@@ -3594,6 +3594,12 @@ static int handle_client(int fd,char *request,size_t used,const char *web_root,m
         plates_delete_response(fd,mqtt,body,body_len);
     } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/measure")==0) {
         plates_measure_response(fd,mqtt,body,body_len);
+    } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/measure/edit")==0) {
+        plates_measure_edit_response(fd,body,body_len);
+    } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/calibrate")==0) {
+        plates_calibrate_response(fd,mqtt,console,body,body_len);
+    } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/calibrate/cancel")==0) {
+        plates_calibrate_cancel_response(fd);
     } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/measure/delete")==0) {
         plates_measure_delete_response(fd,mqtt,body,body_len);
     } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/keep")==0) {
@@ -3730,6 +3736,7 @@ int main(int argc, char **argv) {
         object_query_path = uds_path;
         uds_tick(&telemetry,uds_path);
         plates_tick(&mqtt);
+        plates_calibration_tick(&mqtt,&console);
         fd_set read_set;
         FD_ZERO(&read_set); FD_SET(server,&read_set);
         int max_fd=server;

@@ -639,6 +639,128 @@ static void test_measures(void) {
     unlink(plates_path);
 }
 
+/* The console as the calibration job sees it: every command finishes at once. */
+static console_state console;
+static char console_log[512];
+static int console_ok = 1;
+static int fake_console(console_state *c, const char *command) {
+    size_t used = strlen(console_log);
+    snprintf(console_log + used, sizeof(console_log) - used, "%s%s", used ? "|" : "", command);
+    pthread_mutex_lock(&c->lock);
+    c->generation++; c->busy = 0; c->completed = 1; c->success = console_ok;
+    snprintf(c->command, sizeof(c->command), "%s", command);
+    pthread_mutex_unlock(&c->lock);
+    return 0;
+}
+static int calibrate(const mqtt_client *mqtt, const char *body) {
+    int pair[2]; assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+    plates_calibrate_response(pair[0], mqtt, &console, body, strlen(body));
+    close(pair[0]);
+    size_t used = 0; ssize_t n;
+    while ((n = recv(pair[1], response + used, sizeof(response) - 1 - used, 0)) > 0) used += (size_t)n;
+    response[used] = 0; close(pair[1]);
+    return status_of(response);
+}
+/* What the firmware's calibration does to the file: only the slot changes. */
+static void set_slot_a(const plate_mesh *m) {
+    size_t length, new_length; char *file = slurp(printer_autosave_path, &length);
+    char *updated = autosave_with_mesh(file, length, "default", m, &new_length); assert(updated);
+    FILE *f = fopen(printer_autosave_path, "wb"); assert(f);
+    assert(fwrite(updated, 1, new_length, f) == new_length); fclose(f); free(file); free(updated);
+    memory_a = *m;
+}
+static void bed(double now, double target) {
+    telemetry.values[U_BT] = now; telemetry.values[U_BG] = target;
+    telemetry.present |= (UINT32_C(1) << U_BT) | (UINT32_C(1) << U_BG);
+}
+
+/* A calibration run here: homing, heating, the soak, probing and the plate measurement. */
+static void test_calibration_job(void) {
+    mqtt_client mqtt = {0};
+    plate_mesh at60 = grid(0.6), at70 = grid(0.68), b = grid(0.3);
+    write_autosave(&at60, &b); memory_a = at60; memory_b = b;
+    unlink(plates_path); new_process(); fresh(&mqtt);
+    pthread_mutex_init(&console.lock, NULL);
+    plates_console = fake_console;
+    assert(call(SAVE, &mqtt, "A\nCarbon\n0.05\n60") == 201);
+    char plate[17], first[17], body[128];
+    snprintf(plate, sizeof(plate), "%s", plates.plates[0].id); snprintf(first, sizeof(first), "%s", plates.plates[0].measure);
+    assert(call(NOZZLE, &mqtt, "\n0.6 hardened\n0.6\n0") == 200);
+    char nozzle[17]; snprintf(nozzle, sizeof(nozzle), "%s", plates.nozzles[0].id);
+
+    assert(calibrate(&mqtt, "A\n70\n61") == 400 && calibrate(&mqtt, "A\n30\n10") == 400 && calibrate(&mqtt, "C\n70\n10") == 400);
+    snprintf(body, sizeof(body), "B\n70\n10\n\n%s", plate);
+    assert(calibrate(&mqtt, body) == 409 && strstr(response, "other side"));
+    /* Unhomed: G28 first, then the bed heats; nothing probes before it holds the temperature for the soak. */
+    snprintf(mqtt.homed_axes, sizeof(mqtt.homed_axes), "%s", "");
+    profile_log[0] = console_log[0] = 0;
+    snprintf(body, sizeof(body), "A\n70\n10\n%s\n%s", nozzle, plate);
+    assert(calibrate(&mqtt, body) == 202 && plates_cal.stage == CAL_HOMING && !strcmp(console_log, "G28"));
+    assert(plates_has_profile(measure_find(first))); /* the slot's measurement kept a profile first */
+    assert(calibrate(&mqtt, body) == 409 && strstr(response, "already running"));
+    char late[24];
+    assert(plates_print_prepare(&mqtt, 'A', 1, "", "", late) && call(MOUNT, &mqtt, plate) == 409);
+    plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_HOMING); /* waits for X, Y and Z */
+    snprintf(mqtt.homed_axes, sizeof(mqtt.homed_axes), "%s", "xyz");
+    plates_calibration_tick(&mqtt, &console);
+    assert(plates_cal.stage == CAL_HEATING && !strcmp(console_log, "G28|M140 S70"));
+    bed(45, 70); plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_HEATING);
+    bed(69.4, 70); plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_SOAKING);
+    assert(call(GET, &mqtt, NULL) == 200 && strstr(response, "\"calibration\":{\"stage\":\"soaking\",\"side\":\"A\",\"temp\":70,\"soak\":600,\"remaining\":"));
+    plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_SOAKING);
+    plates_cal.soak_until = monotonic_ms() - 1;
+    plates_calibration_tick(&mqtt, &console);
+    assert(plates_cal.stage == CAL_PROBING && strstr(console_log, "|BED_MESH_CALIBRATE PROFILE=default BED_TEMP=70"));
+    /* The firmware saves the new mesh in the slot; it becomes the plate's 70 degree measurement with the nozzle. */
+    set_slot_a(&at70);
+    plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_SAVING);
+    plates_calibration_tick(&mqtt, &console);
+    assert(!plates_cal.stage && !strcmp(plates_cal.result, "saved") && plate_measure_count(plate) == 2);
+    const plate_measure *m = measure_find(plates_cal.measure);
+    assert(m && m->temp == 70 && !strcmp(m->nozzle, nozzle) && plate_mesh_equal(&m->mesh, &at70, 1));
+    assert(!strcmp(plates.current, plate) && !strcmp(plates.plates[0].measure, m->id) && plates_has_profile(m));
+    assert(call(GET, &mqtt, NULL) == 200 && strstr(response, "\"stage\":\"off\"") && strstr(response, "\"result\":\"saved\""));
+    assert(!plates_print_prepare(&mqtt, 'A', 1, first, "", late) && !strcmp(late, first));
+
+    /* Without a plate the result only stays in the printer; no soak probes at once. */
+    console_log[0] = 0;
+    assert(calibrate(&mqtt, "A\n60\n0") == 202 && !strcmp(console_log, "M140 S60"));
+    plates_calibration_tick(&mqtt, &console); bed(60, 60); plates_calibration_tick(&mqtt, &console);
+    plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_PROBING);
+    plates_calibration_tick(&mqtt, &console); assert(!plates_cal.stage && !strcmp(plates_cal.result, "done"));
+    assert(plate_measure_count(plate) == 2);
+
+    /* Cancelled while soaking; a heater changed meanwhile or a failed homing end the job. */
+    assert(calibrate(&mqtt, "A\n80\n5") == 202); bed(80, 80);
+    plates_calibration_tick(&mqtt, &console); plates_calibration_tick(&mqtt, &console);
+    assert(plates_cal.stage == CAL_SOAKING);
+    int pair[2]; assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+    plates_calibrate_cancel_response(pair[0]); close(pair[0]); close(pair[1]);
+    assert(!plates_cal.stage && !strcmp(plates_cal.result, "cancelled"));
+    assert(calibrate(&mqtt, "A\n80\n5") == 202); bed(80, 80);
+    plates_calibration_tick(&mqtt, &console); plates_calibration_tick(&mqtt, &console); bed(80, 0);
+    plates_calibration_tick(&mqtt, &console);
+    assert(!strcmp(plates_cal.result, "failed") && !strcmp(plates_cal.error, "heating"));
+    snprintf(mqtt.homed_axes, sizeof(mqtt.homed_axes), "%s", ""); console_ok = 0;
+    assert(calibrate(&mqtt, "A\n80\n5") == 202); plates_calibration_tick(&mqtt, &console);
+    assert(!strcmp(plates_cal.result, "failed") && !strcmp(plates_cal.error, "homing"));
+    console_ok = 1; telemetry.present &= ~((UINT32_C(1) << U_BT) | (UINT32_C(1) << U_BG));
+
+    /* What a measurement records can be corrected, e.g. the nozzle of one made before nozzles were listed. */
+    snprintf(body, sizeof(body), "%s\n70\n%s", first, nozzle);
+    int edit = socketpair(AF_UNIX, SOCK_STREAM, 0, pair); assert(!edit);
+    plates_measure_edit_response(pair[0], body, strlen(body)); close(pair[0]);
+    ssize_t got = recv(pair[1], response, sizeof(response) - 1, 0); response[got > 0 ? got : 0] = 0; close(pair[1]);
+    assert(status_of(response) == 409 && strstr(response, "already has a measurement"));
+    snprintf(body, sizeof(body), "%s\n65\n%s", first, nozzle);
+    assert(!socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
+    plates_measure_edit_response(pair[0], body, strlen(body)); close(pair[0]);
+    got = recv(pair[1], response, sizeof(response) - 1, 0); response[got > 0 ? got : 0] = 0; close(pair[1]);
+    assert(status_of(response) == 200 && measure_find(first)->temp == 65 && !strcmp(measure_find(first)->nozzle, nozzle));
+    new_process(); assert(measure_find(first)->temp == 65);
+    unlink(plates_path);
+}
+
 static void test_print_setup(void) {
     char directory[] = "/tmp/cc2-setup-XXXXXX", path[64];
     assert(mkdtemp(directory));
@@ -696,6 +818,7 @@ int main(void) {
     test_version_1();
     test_http();
     test_measures();
+    test_calibration_job();
     test_print_setup();
     test_background_transport();
     printf("PASS: plate library\n");
