@@ -34,6 +34,10 @@
 #include "http_guard.h"
 
 static uds_client telemetry;
+/* Build-plate measurement and nozzle chosen for a print (plates.h). */
+static const char *plates_print_prepare(const mqtt_client *mqtt, char side, int saved_mesh, const char *measure,
+                                        const char *nozzle, char *late);
+static void plates_print_arm(const char *late, char side);
 static int z_offset_pending;
 static double z_offset_expected;
 static int z_offset_session;
@@ -1468,6 +1472,48 @@ static int gcode_read_filaments(const char *root, const char *relative,
     return failed ? -1 : 0;
 }
 
+/* The first-layer bed temperature (the first M190/M140 with S above 0) and the
+ * slicer's nozzle diameter (its configuration block at the end of the file).
+ * Either stays -1 when the file does not state it. */
+static int gcode_read_setup(const char *root, const char *relative, double *bed, double *nozzle) {
+    char path[PATH_MAX_LOCAL * 2], line[4096];
+    *bed = -1; *nozzle = -1;
+    if (!gcode_resolved_path(root, relative, path, sizeof(path))) return -1;
+    FILE *file = fopen(path, "r");
+    if (!file) return -1;
+    size_t scanned = 0;
+    while (*bed < 0 && scanned < 4 * 1024 * 1024 && fgets(line, sizeof(line), file)) {
+        scanned += strlen(line);
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if ((p[0] != 'M' && p[0] != 'm') || (strncmp(p + 1, "190", 3) && strncmp(p + 1, "140", 3)) ||
+            (p[4] != ' ' && p[4] != '\t')) continue;
+        for (p += 4; *p && *p != ';'; p++) {
+            if ((*p != 'S' && *p != 's') || (p[-1] != ' ' && p[-1] != '\t')) continue;
+            char *end; double value = strtod(p + 1, &end);
+            if (end != p + 1 && isfinite(value) && value > 0 && value <= 200) *bed = value;
+            break;
+        }
+    }
+    long size = fseek(file, 0, SEEK_END) == 0 ? ftell(file) : -1;
+    if (size > 0 && fseek(file, size > 256 * 1024 ? size - 256 * 1024 : 0, SEEK_SET) == 0) {
+        if (size > 256 * 1024 && !fgets(line, sizeof(line), file)) line[0] = 0; /* skip a partial line */
+        while (fgets(line, sizeof(line), file)) {
+            const char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p++ != ';') continue;
+            while (*p == ' ' || *p == '\t') p++;
+            if (strncmp(p, "nozzle_diameter", 15)) continue;
+            for (p += 15; *p == ' ' || *p == '\t'; p++) {}
+            if (*p++ != '=') continue;
+            char *end; double value = strtod(p, &end);
+            if (end != p && isfinite(value) && value >= 0.1 && value <= 2.0) *nozzle = value;
+        }
+    }
+    int failed = ferror(file); fclose(file);
+    return failed ? -1 : 0;
+}
+
 static int gcode_has_adaptive_mesh(const char *root, const char *relative, int *adaptive) {
     char path[PATH_MAX_LOCAL * 2], line[4096];
     if (!adaptive || !gcode_resolved_path(root, relative, path, sizeof(path))) return -1;
@@ -1582,9 +1628,15 @@ static void gcode_inspect_response(int fd, const char *body, size_t body_len) {
         if (length < 0 || (size_t)length >= sizeof(response) - used) return;
         used += (size_t)length;
     }
+    double bed = -1, nozzle = -1;
+    char bed_value[24] = "null", nozzle_value[24] = "null";
+    if (gcode_read_setup(root, filename, &bed, &nozzle) == 0) {
+        if (bed > 0) snprintf(bed_value, sizeof(bed_value), "%.0f", bed);
+        if (nozzle > 0) snprintf(nozzle_value, sizeof(nozzle_value), "%.2f", nozzle);
+    }
     length = snprintf(response + used, sizeof(response) - used,
-                      "],\"multicolour\":%s,\"adaptive_mesh\":%s}\n",
-                      count > 1 ? "true" : "false", adaptive ? "true" : "false");
+                      "],\"multicolour\":%s,\"adaptive_mesh\":%s,\"bed_temperature\":%s,\"nozzle_diameter\":%s}\n",
+                      count > 1 ? "true" : "false", adaptive ? "true" : "false", bed_value, nozzle_value);
     if (length > 0 && (size_t)length < sizeof(response) - used)
         analysis_respond(fd, 200, "OK", "application/json; charset=utf-8", response, used + (size_t)length);
 }
@@ -1799,7 +1851,8 @@ static void gcode_start_response(int fd, mqtt_client *mqtt,
     }
     const char *layout_line = memchr(mapping, '\n', mapping_len);
     size_t map_len = layout_line ? (size_t)(layout_line - mapping) : mapping_len;
-    const char *level_line = NULL, *video_line = NULL; size_t layout_len = 0, level_len = 0, video_len = 0;
+    const char *level_line = NULL, *video_line = NULL, *measure_line = NULL, *nozzle_line = NULL;
+    size_t layout_len = 0, level_len = 0, video_len = 0, measure_len = 0, nozzle_len = 0;
     if (layout_line) {
         layout_line++;
         size_t remaining = mapping_len - (size_t)(layout_line - mapping);
@@ -1809,9 +1862,29 @@ static void gcode_start_response(int fd, mqtt_client *mqtt,
             level_line++;size_t rest=mapping_len-(size_t)(level_line-mapping);
             video_line=memchr(level_line,'\n',rest);
             level_len=video_line?(size_t)(video_line-level_line):rest;
-            if(video_line){video_line++;video_len=mapping_len-(size_t)(video_line-mapping);}
+            if(video_line){
+                video_line++;size_t left=mapping_len-(size_t)(video_line-mapping);
+                measure_line=memchr(video_line,'\n',left);
+                video_len=measure_line?(size_t)(measure_line-video_line):left;
+                if(measure_line){
+                    measure_line++;left=mapping_len-(size_t)(measure_line-mapping);
+                    nozzle_line=memchr(measure_line,'\n',left);
+                    measure_len=nozzle_line?(size_t)(nozzle_line-measure_line):left;
+                    if(nozzle_line){nozzle_line++;nozzle_len=mapping_len-(size_t)(nozzle_line-mapping);}
+                }
+            }
         }
     }
+    /* Optional: the build-plate measurement and nozzle from the print dialog. */
+    char measure[24] = "", nozzle[24] = "";
+    while (nozzle_len && (nozzle_line[nozzle_len - 1] == '\n' || nozzle_line[nozzle_len - 1] == '\r')) nozzle_len--;
+    if (measure_len >= sizeof(measure) || nozzle_len >= sizeof(nozzle)) {
+        const char *error = "{\"accepted\":false,\"error\":\"Invalid build plate measurement\"}\n";
+        respond(fd, 400, "Bad Request", "application/json; charset=utf-8", error, strlen(error));
+        return;
+    }
+    if (measure_len) memcpy(measure, measure_line, measure_len);
+    if (nozzle_len) memcpy(nozzle, nozzle_line, nozzle_len);
     char print_layout = 'A';
     if (layout_len) {
         if (layout_len != 1 || (layout_line[0] != 'A' && layout_line[0] != 'B')) {
@@ -1890,6 +1963,20 @@ static void gcode_start_response(int fd, mqtt_client *mqtt,
         respond(fd, 409, "Conflict", "application/json; charset=utf-8", error, strlen(error));
         return;
     }
+    int missing_plate_mesh = !saved_plate_mesh_exists(print_layout);
+    int calibration_requested = strcmp(leveling, "calibrate") == 0;
+    int force_full_mesh = strcmp(leveling, "full") == 0 || missing_plate_mesh ||
+                          (calibration_requested && !adaptive);
+    int calibrated_start = strcmp(leveling, "saved") != 0 || missing_plate_mesh;
+    char late[24] = "";
+    const char *plate_problem = plates_print_prepare(mqtt, print_layout, !calibrated_start, measure, nozzle, late);
+    if (plate_problem) {
+        char escaped[256], error[384];
+        json_escape(escaped, sizeof(escaped), plate_problem);
+        snprintf(error, sizeof(error), "{\"accepted\":false,\"error\":\"%s\"}\n", escaped);
+        respond(fd, 409, "Conflict", "application/json; charset=utf-8", error, strlen(error));
+        return;
+    }
     char print_filename[PATH_MAX_LOCAL];
     const char *print_media = media;
     if (strcmp(storage, "usb") == 0) {
@@ -1902,11 +1989,6 @@ static void gcode_start_response(int fd, mqtt_client *mqtt,
     } else {
         snprintf(print_filename, sizeof(print_filename), "%s", filename);
     }
-    int missing_plate_mesh = !saved_plate_mesh_exists(print_layout);
-    int calibration_requested = strcmp(leveling, "calibrate") == 0;
-    int force_full_mesh = strcmp(leveling, "full") == 0 || missing_plate_mesh ||
-                          (calibration_requested && !adaptive);
-    int calibrated_start = strcmp(leveling, "saved") != 0 || missing_plate_mesh;
     int start_result = -1;
     if (calibrated_start) {
         char script[4096];
@@ -1929,12 +2011,13 @@ static void gcode_start_response(int fd, mqtt_client *mqtt,
         respond(fd, 503, "Service Unavailable", "application/json; charset=utf-8", error, strlen(error));
         return;
     }
+    plates_print_arm(late, print_layout);
     char accepted[PATH_MAX_LOCAL * 2 + 128], escaped[PATH_MAX_LOCAL * 2];
     json_escape(escaped, sizeof(escaped), print_filename);
     int accepted_len = snprintf(accepted, sizeof(accepted),
-        "{\"accepted\":true,\"method\":1020,\"storage_media\":\"%s\",\"filename\":\"%s\",\"imported_from_usb\":%s,\"print_layout\":\"%c\",\"leveling\":\"%s\",\"timelapse\":%s}\n",
+        "{\"accepted\":true,\"method\":1020,\"storage_media\":\"%s\",\"filename\":\"%s\",\"imported_from_usb\":%s,\"print_layout\":\"%c\",\"leveling\":\"%s\",\"timelapse\":%s,\"late_mesh\":\"%s\"}\n",
         print_media, escaped, strcmp(storage, "usb") == 0 ? "true" : "false",
-        print_layout, leveling, timelapse ? "true" : "false");
+        print_layout, leveling, timelapse ? "true" : "false", late);
     if (accepted_len > 0 && (size_t)accepted_len < sizeof(accepted))
         respond(fd, 202, "Accepted", "application/json; charset=utf-8", accepted, (size_t)accepted_len);
 }
@@ -2826,10 +2909,10 @@ static void mesh_response(int fd) {
         close(uds); const char *error="{\"available\":false,\"error\":\"Mesh query failed\"}\n";
         respond(fd,503,"Service Unavailable","application/json; charset=utf-8",error,strlen(error)); return;
     }
-    char *result=malloc(65537); size_t used=0;
+    char *result=malloc(131073); size_t used=0;
     if(!result){close(uds);return;}
-    while(used<65536){
-        ssize_t n=recv(uds,result+used,65536-used,0);
+    while(used<131072){
+        ssize_t n=recv(uds,result+used,131072-used,0);
         if(n<=0)break;
         used+=(size_t)n;
         char *end=memchr(result,3,used);
@@ -3508,7 +3591,19 @@ static int handle_client(int fd,char *request,size_t used,const char *web_root,m
     } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/edit")==0) {
         plates_edit_response(fd,mqtt,body,body_len);
     } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/delete")==0) {
-        plates_delete_response(fd,body,body_len);
+        plates_delete_response(fd,mqtt,body,body_len);
+    } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/measure")==0) {
+        plates_measure_response(fd,mqtt,body,body_len);
+    } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/measure/delete")==0) {
+        plates_measure_delete_response(fd,mqtt,body,body_len);
+    } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/keep")==0) {
+        plates_keep_response(fd,mqtt,body,body_len);
+    } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/nozzle")==0) {
+        plates_nozzle_save_response(fd,mqtt,body,body_len);
+    } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/nozzle/delete")==0) {
+        plates_nozzle_delete_response(fd,mqtt,body,body_len);
+    } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/nozzle/select")==0) {
+        plates_nozzle_select_response(fd,mqtt,body,body_len);
     } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/mount")==0) {
         plates_mount_response(fd,mqtt,body,body_len);
     } else if (strcmp(method,"POST")==0 && strcmp(path,"/api/plates/unmount")==0) {
@@ -3644,7 +3739,7 @@ int main(int argc, char **argv) {
         for(int i=0;i<HTTP_PENDING_MAX;i++)if(pending[i].fd>=0){
             FD_SET(pending[i].fd,&read_set);if(pending[i].fd>max_fd)max_fd=pending[i].fd;receiving=1;
         }
-        int short_wait=receiving||plates_background_active();
+        int short_wait=receiving||plates_background_active()||plates_late_active();
         struct timeval wait={short_wait?0:1,short_wait?100000:0};
         int ready=select(max_fd+1,&read_set,NULL,NULL,&wait);
         if(ready<0){if(errno==EINTR)continue;perror("select");break;}

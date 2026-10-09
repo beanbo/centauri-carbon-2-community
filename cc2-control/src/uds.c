@@ -11,7 +11,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-static const char subscription[] = "{\"id\":11,\"method\":\"objects/subscribe\",\"params\":{\"objects\":{\"extruder\":[\"temperature\",\"target\"],\"heater_bed\":[\"temperature\",\"target\"],\"gcode_move\":[\"speed_factor\",\"extrude_factor\",\"homing_origin\"],\"motion_report\":[\"live_velocity\"],\"print_stats\":[\"filename\",\"state\",\"info\",\"print_duration\",\"total_duration\",\"filament_used\"],\"canvas_dev\":[\"active_cid\"],\"virtual_sdcard\":[\"progress\"],\"exclude_object\":[\"excluded_objects\",\"current_object\"],\"fan\":[\"speed\",\"rpm\"],\"fan_generic fan1\":[\"speed\",\"rpm\"],\"controller_fan board_cooling_fan\":[\"speed\",\"rpm\"],\"heater_fan heatbreak_cooling_fan\":[\"speed\",\"rpm\"]},\"response_template\":{\"method\":\"cc2_status\"}}}\003"
+static const char subscription[] = "{\"id\":11,\"method\":\"objects/subscribe\",\"params\":{\"objects\":{\"extruder\":[\"temperature\",\"target\"],\"heater_bed\":[\"temperature\",\"target\"],\"gcode_move\":[\"speed_factor\",\"extrude_factor\",\"homing_origin\"],\"motion_report\":[\"live_velocity\"],\"print_stats\":[\"filename\",\"state\",\"info\",\"print_duration\",\"total_duration\",\"filament_used\"],\"canvas_dev\":[\"active_cid\"],\"bed_mesh\":[\"profile_name\"],\"virtual_sdcard\":[\"progress\"],\"exclude_object\":[\"excluded_objects\",\"current_object\"],\"fan\":[\"speed\",\"rpm\"],\"fan_generic fan1\":[\"speed\",\"rpm\"],\"controller_fan board_cooling_fan\":[\"speed\",\"rpm\"],\"heater_fan heatbreak_cooling_fan\":[\"speed\",\"rpm\"]},\"response_template\":{\"method\":\"cc2_status\"}}}\003"
  "{\"id\":13,\"method\":\"gcode/subscribe_report\",\"params\":{\"response_template\":{\"method\":\"cc2_report\"}}}\003";
 static const char heartbeat[]="{\"id\":12,\"method\":\"info\",\"params\":{}}\003";
 static double elapsed(struct timespec a,struct timespec b){return (double)(a.tv_sec-b.tv_sec)+(a.tv_nsec-b.tv_nsec)/1e9;}
@@ -90,6 +90,15 @@ static int filename_read(const char *o,const char *e,char *out,size_t cap){
   if(ch<32||n+1>=cap)return 0;
   out[n++]=(char)ch;
  }
+ out[n]=0;return 1;
+}
+/* bed_mesh.profile_name: empty after BED_MESH_CLEAR, else a profile such as
+ * default, ADAPTIVE or cc2_<id>. Other characters or longer names are ignored. */
+static int profile_read(const char *o,const char *e,char *out,size_t cap){
+ const char *p=json_member(o,e,"profile_name");if(!p||*p!='"')return 0;
+ const char *end=json_string_end(p,e);if(!end)return 0;
+ size_t n=0;
+ for(p++;p<end-1;p++){if(!(isalnum((unsigned char)*p)||*p=='_'||*p=='-')||n+1>=cap)return 0;out[n++]=*p;}
  out[n]=0;return 1;
 }
 /* A short lowercase word, such as print_stats.state; anything else is ignored. */
@@ -212,6 +221,11 @@ int uds_message(uds_client *c,const char *json,size_t length){
  if(ps&&(!older||!c->have_print_state)&&word_read(ps,pe,"state",state,sizeof(state))){
   strcpy(c->print_state,state);c->have_print_state=1;
  }
+ const char *be;const char *bm=json_member_object(status,se,"bed_mesh",'{',&be);
+ char profile[sizeof(c->mesh_profile)];
+ if(bm&&(!older||!c->have_mesh_profile)&&profile_read(bm,be,profile,sizeof(profile))){
+  strcpy(c->mesh_profile,profile);c->have_mesh_profile=1;
+ }
  for(size_t i=0;i<sizeof(fields)/sizeof(fields[0]);i++){
   const char *oe;const char *o=json_member_object(status,se,fields[i].object,'{',&oe);double v;
   if((!older||!(c->present&(UINT32_C(1)<<fields[i].field)))&&o&&numeric(o,oe,fields[i].key,&v)&&v>=fields[i].min&&v<=fields[i].max){
@@ -259,7 +273,7 @@ int uds_message(uds_client *c,const char *json,size_t length){
 void uds_init(uds_client *c){memset(c,0,sizeof(*c));c->fd=-1;}
 void uds_close(uds_client *c){
  if(c->fd>=0)close(c->fd);
- c->fd=-1;c->ready=0;c->present=0;c->used=c->sent=0;c->have_filename=c->have_print_state=0;
+ c->fd=-1;c->ready=0;c->present=0;c->used=c->sent=0;c->have_filename=c->have_print_state=c->have_mesh_profile=0;
  c->have_excluded_objects=c->have_current_object=0;
 }
 static void uds_disconnect(uds_client *c,const char *reason,int error){
@@ -271,6 +285,7 @@ int uds_value(const uds_client *c,enum uds_field field,double *out){
  *out=c->values[field];return 1;
 }
 const char *uds_print_state(const uds_client *c){return uds_fresh(c)&&c->have_print_state?c->print_state:NULL;}
+const char *uds_mesh_profile(const uds_client *c){return uds_fresh(c)&&c->have_mesh_profile?c->mesh_profile:NULL;}
 void uds_tick(uds_client *c,const char *path){
  struct timespec now=now_mono();
  if(c->fd>=0&&elapsed(now,c->last_rx)>5)uds_disconnect(c,"receive_timeout",0);

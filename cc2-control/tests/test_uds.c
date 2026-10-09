@@ -73,7 +73,14 @@ int main(void){
  assert(uds_value(&c,U_CANVAS_CHANNEL,&v)&&v==-1&&!strcmp(uds_print_state(&c),"complete"));
  message(&c,"{\"method\":\"cc2_status\",\"params\":{\"eventtime\":9,\"status\":{\"canvas_dev\":{\"active_cid\":99},\"print_stats\":{\"state\":\"Bad <b>\"}}}}");
  assert(uds_value(&c,U_CANVAS_CHANNEL,&v)&&v==-1&&!strcmp(uds_print_state(&c),"complete"));
- close(pair[1]);uds_process(&c);assert(c.fd==-1&&!c.ready&&!c.present&&!uds_print_state(&c));
+ /* The mesh the printer applies: a profile name, empty once cleared; other text is ignored. */
+ message(&c,"{\"method\":\"cc2_status\",\"params\":{\"eventtime\":10,\"status\":{\"bed_mesh\":{\"profile_name\":\"cc2_0123456789abcdef\"}}}}");
+ assert(!strcmp(uds_mesh_profile(&c),"cc2_0123456789abcdef"));
+ message(&c,"{\"method\":\"cc2_status\",\"params\":{\"eventtime\":11,\"status\":{\"bed_mesh\":{\"profile_name\":\"a b\"}}}}");
+ assert(!strcmp(uds_mesh_profile(&c),"cc2_0123456789abcdef"));
+ message(&c,"{\"method\":\"cc2_status\",\"params\":{\"eventtime\":12,\"status\":{\"bed_mesh\":{\"profile_name\":\"\"}}}}");
+ assert(!strcmp(uds_mesh_profile(&c),""));
+ close(pair[1]);uds_process(&c);assert(c.fd==-1&&!c.ready&&!c.present&&!uds_print_state(&c)&&!uds_mesh_profile(&c));
  assert(c.disconnects==1&&!strcmp(c.last_disconnect,"peer_closed"));
  assert(c.report_sequence==4&&!strcmp(c.report_message,"\"Resume\""));
  uds_init(&c);assert(!socketpair(AF_UNIX,SOCK_STREAM,0,pair));c.fd=pair[0];
