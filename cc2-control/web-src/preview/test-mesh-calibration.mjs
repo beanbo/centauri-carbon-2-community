@@ -40,7 +40,7 @@ try {
   const toast = text => page.getByText(text, { exact: true }).waitFor()
 
   await page.goto(`${origin}/#bed`)
-  await page.selectOption('#preview-scene', 'idle')
+  await Promise.all([page.waitForEvent('load'), page.selectOption('#preview-scene', 'idle')]) // the scenario reloads the page
   // Labels wrap their controls, so address the control inside each label.
   const field = text => page.locator('label', { hasText: text }).locator('select, input')
   const side = field('Calibration plate side'), temperature = field('Bed temperature, °C')

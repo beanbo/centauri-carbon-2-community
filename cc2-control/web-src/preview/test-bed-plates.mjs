@@ -44,7 +44,7 @@ try {
     await route.fulfill({ response, json: data })
   })
   await page.goto(`${origin}/#bed/plates`)
-  await page.selectOption('#preview-scene', 'idle')
+  await Promise.all([page.waitForEvent('load'), page.selectOption('#preview-scene', 'idle')])
   await page.getByRole('heading', { name: 'Build Plate Library' }).waitFor()
   const card = name => page.locator('[data-plate]').filter({ has: page.getByText(name, { exact: true }) })
   const row = (name, temp) => card(name).locator('[data-measure]').filter({ has: page.getByText(`${temp} °C`, { exact: true }) })
@@ -191,9 +191,11 @@ try {
   await card('Glass').waitFor({ state: 'detached' })
 
   // While printing, the printer-changing actions wait for Idle.
-  await page.selectOption('#preview-scene', 'printing')
+  // The scenario change reloads the page; the old page still shows an idle printer until then.
+  await Promise.all([page.waitForEvent('load'), page.selectOption('#preview-scene', 'printing')])
   await page.getByRole('heading', { name: 'Build Plate Library' }).waitFor()
   const mount = card('Cool Plate').getByRole('button', { name: 'Mount', exact: true }) // the scenario reset restores Smooth PEI
+  for (let i = 0; i < 100 && !(await mount.isDisabled()); i++) await page.waitForTimeout(100)
   assert.ok(await mount.isDisabled())
   assert.equal(await mount.getAttribute('title'), 'Available when idle')
   assert.ok(await page.getByRole('button', { name: 'Save Plate', exact: true }).isDisabled())
@@ -213,7 +215,7 @@ try {
     return r.fulfill({ status: 202, json: { accepted: true } })
   })
   await page.goto(`${origin}/#files`)
-  await page.selectOption('#preview-scene', 'idle')
+  await Promise.all([page.waitForEvent('load'), page.selectOption('#preview-scene', 'idle')])
   const print = async check => {
     await page.getByRole('button', { name: 'Print', exact: true }).first().click()
     const dialog = page.getByRole('dialog')
