@@ -54,7 +54,7 @@ export type Calibration = {
   nozzle: string
   measure: string
   result: '' | 'done' | 'saved' | 'failed' | 'cancelled'
-  error: '' | 'homing' | 'heating' | 'busy' | 'probing' | 'saving'
+  error: '' | 'homing' | 'heating' | 'busy' | 'telemetry' | 'probing' | 'saving'
   detail: string
 }
 export type PlateLibrary = {

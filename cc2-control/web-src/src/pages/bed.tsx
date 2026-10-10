@@ -332,6 +332,7 @@ const FAILED: Record<string, Key> = {
   homing: 'bed.homing_did_not_finish',
   heating: 'bed.cal_failed_heating',
   busy: 'bed.cal_failed_busy',
+  telemetry: 'bed.cal_failed_telemetry',
   probing: 'bed.cal_failed_probing',
 }
 

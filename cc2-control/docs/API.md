@@ -259,8 +259,11 @@ that holds it. A print started from CC2 Control on the saved mesh may choose a m
 plate. When it is not the side's slot, CC2 Control watches the print start through `bed_mesh.profile_name`
 in its telemetry subscription: whenever the printer has loaded the side slot (before the file and again at
 `G180 S7`) and the first layer has not begun, it sends `BED_MESH_PROFILE LOAD=cc2_<id>` (at most eight
-times per print). A load that comes too late leaves the side mesh in use and is reported as `missed`; an
-adaptive mesh (`ADAPTIVE`) is never replaced. Requires printer validation.
+times per print). A load needs positive proof of that window: fresh telemetry reading layer 0 of this
+print (`print_stats.info.current_layer`, which a new print resets) while it is printing. A stale count from
+the last print, a stream that reconnects after the first layer began, or a pause therefore never load. A
+load that comes too late leaves the side mesh in use and is reported as `missed`; an adaptive mesh
+(`ADAPTIVE`) is never replaced. Requires printer validation.
 
 Endpoints (all changes are `POST` with a text body, one field per line, and need `X-CC2-Request: 1`):
 
@@ -291,10 +294,12 @@ Endpoints (all changes are `POST` with a text body, one field per line, and need
   BED_TEMP=<t>` through the console. With a plate, the result becomes its measurement as with
   `/api/plates/measure`. `GET /api/plates` reports it as `calibration` (`stage` `homing`, `heating`,
   `soaking`, `probing`, `saving` or `off`, the soak seconds `remaining`, the bed temperature `bed`, and
-  `result` `done`, `saved`, `failed` or `cancelled` with `error` `homing`, `heating`, `busy`, `probing` or
-  `saving`). `/api/plates/calibrate/cancel` stops it and switches the bed heater off until the probing
-  starts. Print starts and plate changes are refused while it runs; a print started meanwhile, or a changed
-  bed target, ends it.
+  `result` `done`, `saved`, `failed` or `cancelled` with `error` `homing`, `heating`, `busy`, `telemetry`,
+  `probing` or `saving`). At the end of the soak the probing starts only when MQTT has reported Idle within
+  15 s and fresh telemetry reads the bed at its target; otherwise it waits up to a minute and then stops,
+  switching the bed heater off only when the printer is known to be idle. `/api/plates/calibrate/cancel`
+  stops it and switches the bed heater off until the probing starts. Print starts and plate changes are
+  refused while it runs; a print started meanwhile, or a changed bed target, ends it.
 - `/api/plates/mount` (id, optionally a measurement id) mounts a plate whose measurement is already in its
   slot and applies its Z offset with `SET_GCODE_OFFSET Z=` (no movement). Any other answers 409 with
   `"reboot_required": true`; adding a line `REBOOT` writes the slot (the previous file becomes `autosave_backup.cfg`, a copy

@@ -592,12 +592,14 @@ static void test_measures(void) {
     telemetry.values[U_LAYER] = 67; telemetry.present |= UINT32_C(1) << U_LAYER;
     plates_tick(&mqtt); assert(plates_late.state == 1 && !profile_log[0]); /* not started yet */
     strcpy(telemetry.print_state, "printing");
-    plates_tick(&mqtt); /* a stale layer count from the last print is not the first layer */
-    assert(plates_late.state == 2 && !strncmp(profile_log, "BED_MESH_PROFILE LOAD=cc2_", 26));
-    assert(strstr(profile_log, first) && plates_late.loads == 1);
+    /* A stale layer count from the last print is neither the first layer nor proof of the start. */
+    plates_tick(&mqtt); assert(plates_late.state == 2 && !plates_late.loads && !profile_log[0]);
+    telemetry.values[U_LAYER] = 0;
+    plates_tick(&mqtt); assert(plates_late.layer_reset && plates_late.loads == 1);
+    assert(!strncmp(profile_log, "BED_MESH_PROFILE LOAD=cc2_", 26) && strstr(profile_log, first));
     plates_tick(&mqtt); assert(plates_late.loads == 1); /* waits for the push before loading again */
-    plates_late.sent -= 2000; telemetry.values[U_LAYER] = 0;
-    plates_tick(&mqtt); assert(plates_late.loads == 2 && plates_late.layer_reset);
+    plates_late.sent -= 2000;
+    plates_tick(&mqtt); assert(plates_late.loads == 2);
     snprintf(telemetry.mesh_profile, sizeof(telemetry.mesh_profile), "cc2_%s", first);
     plates_late.sent -= 2000; plates_tick(&mqtt); assert(plates_late.loads == 2);
     strcpy(telemetry.mesh_profile, "default"); plates_late.sent -= 2000; /* G180 S7 */
@@ -611,6 +613,22 @@ static void test_measures(void) {
     plates_print_arm(first, 'A'); strcpy(telemetry.mesh_profile, "default"); telemetry.values[U_LAYER] = 0;
     plates_tick(&mqtt); telemetry.values[U_LAYER] = 1; plates_tick(&mqtt);
     assert(!plates_late.state && !strcmp(plates_late_result, "missed"));
+    /* Telemetry that reconnects after the first layer began never loads: the stale count
+     * from the last print would have kept layer_reset false, and layer 0 is never read. */
+    plates_print_arm(first, 'A'); telemetry.values[U_LAYER] = 120; strcpy(telemetry.mesh_profile, "default");
+    plates_tick(&mqtt); assert(plates_late.state == 2);
+    telemetry.present &= ~(UINT32_C(1) << U_LAYER); /* the stream reconnects */
+    plates_late.sent = 0; plates_tick(&mqtt);
+    telemetry.values[U_LAYER] = 3; telemetry.present |= UINT32_C(1) << U_LAYER; /* the first snapshot */
+    for (int i = 0; i < 4; ++i) { plates_late.sent = 0; plates_tick(&mqtt); }
+    assert(plates_late.state == 2 && !plates_late.loads);
+    strcpy(telemetry.print_state, "complete"); plates_tick(&mqtt);
+    assert(!plates_late.state && !strcmp(plates_late_result, "ended"));
+    strcpy(telemetry.print_state, "printing");
+    /* Nor while the print is paused before its first layer. */
+    plates_print_arm(first, 'A'); telemetry.values[U_LAYER] = 0; strcpy(telemetry.print_state, "paused");
+    plates_tick(&mqtt); assert(plates_late.state == 2 && !plates_late.loads);
+    strcpy(telemetry.print_state, "printing"); plates_tick(&mqtt); assert(plates_late.loads == 1);
     /* A print that probes its own mesh is left alone. */
     plates_print_arm(first, 'A'); telemetry.values[U_LAYER] = 0; strcpy(telemetry.mesh_profile, "ADAPTIVE");
     plates_tick(&mqtt); assert(!plates_late.state && !strcmp(plates_late_result, "adaptive"));
@@ -709,8 +727,16 @@ static void test_calibration_job(void) {
     assert(call(GET, &mqtt, NULL) == 200 && strstr(response, "\"calibration\":{\"stage\":\"soaking\",\"side\":\"A\",\"temp\":70,\"soak\":600,\"remaining\":"));
     plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_SOAKING);
     plates_cal.soak_until = monotonic_ms() - 1;
+    /* The end of the soak waits for fresh evidence: no bed telemetry, a bed below its target or stale
+     * MQTT hold the probing back. */
+    telemetry.present &= ~((UINT32_C(1) << U_BT) | (UINT32_C(1) << U_BG));
+    plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_SOAKING && plates_cal.held);
+    bed(66, 70); plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_SOAKING);
+    bed(69.6, 70); mqtt.last_message -= 20; plates_calibration_tick(&mqtt, &console);
+    assert(plates_cal.stage == CAL_SOAKING && !strstr(console_log, "BED_MESH_CALIBRATE"));
+    fresh(&mqtt);
     plates_calibration_tick(&mqtt, &console);
-    assert(plates_cal.stage == CAL_PROBING && strstr(console_log, "|BED_MESH_CALIBRATE PROFILE=default BED_TEMP=70"));
+    assert(plates_cal.stage == CAL_PROBING && !plates_cal.held && strstr(console_log, "|BED_MESH_CALIBRATE PROFILE=default BED_TEMP=70"));
     /* The firmware saves the new mesh in the slot; it becomes the plate's 70 degree measurement with the nozzle. */
     set_slot_a(&at70);
     plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_SAVING);
@@ -741,6 +767,14 @@ static void test_calibration_job(void) {
     plates_calibration_tick(&mqtt, &console); plates_calibration_tick(&mqtt, &console); bed(80, 0);
     plates_calibration_tick(&mqtt, &console);
     assert(!strcmp(plates_cal.result, "failed") && !strcmp(plates_cal.error, "heating"));
+    /* Evidence that stays missing for a minute stops the run without touching a heater it cannot see. */
+    assert(calibrate(&mqtt, "A\n80\n5") == 202); bed(80, 80);
+    plates_calibration_tick(&mqtt, &console); plates_calibration_tick(&mqtt, &console);
+    plates_cal.soak_until = monotonic_ms() - 1;
+    telemetry.present &= ~((UINT32_C(1) << U_BT) | (UINT32_C(1) << U_BG));
+    plates_calibration_tick(&mqtt, &console); assert(plates_cal.stage == CAL_SOAKING);
+    plates_cal.held -= 61000; plates_calibration_tick(&mqtt, &console);
+    assert(!plates_cal.stage && !strcmp(plates_cal.result, "failed") && !strcmp(plates_cal.error, "telemetry"));
     snprintf(mqtt.homed_axes, sizeof(mqtt.homed_axes), "%s", ""); console_ok = 0;
     assert(calibrate(&mqtt, "A\n80\n5") == 202); plates_calibration_tick(&mqtt, &console);
     assert(!strcmp(plates_cal.result, "failed") && !strcmp(plates_cal.error, "homing"));

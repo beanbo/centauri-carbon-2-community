@@ -80,6 +80,7 @@
   "bed.cal_cancelled": "校准已停止，热床加热已关闭。",
   "bed.cal_failed_heating": "热床未能保持温度，校准已停止。",
   "bed.cal_failed_busy": "打印机开始执行其他任务，校准已停止。",
+  "bed.cal_failed_telemetry": "打印机状态或热床遥测一直不可用，校准已停止。",
   "bed.cal_failed_probing": "打印机在校准过程中报告了错误。",
   "bed.invalid_soak": "保温时间须为 0 至 60 之间的整数分钟。",
   "bed.start_a_protected_calibration_when": "空闲时开始受保护校准。",

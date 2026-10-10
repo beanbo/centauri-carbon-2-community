@@ -106,9 +106,10 @@ static struct {
     char side;
     char plate[PLATE_ID_LEN + 1], nozzle[PLATE_ID_LEN + 1], measure[PLATE_ID_LEN + 1];
     long long since, soak_until, done_at; /* stage start, end of the soak, when the console command finished */
+    long long held; /* since when the end of the soak waits for fresh evidence */
     unsigned long generation; /* the console command the stage waits for */
     const char *result; /* "", "done" (no plate), "saved", "failed" or "cancelled" */
-    const char *error;  /* what failed: "homing", "heating", "busy", "probing" or "saving" */
+    const char *error;  /* what failed: "homing", "heating", "busy", "telemetry", "probing" or "saving" */
     char detail[160];
 } plates_cal = {.result = "", .error = ""};
 
@@ -1666,10 +1667,19 @@ static void plates_late_tick(void) {
     if (have_layer && layer < 1) plates_late.layer_reset = 1;
     if (plates_late.layer_reset && have_layer && layer >= 1) { plates_late_finish(ours ? "loaded" : "missed"); return; }
     if (!strcmp(profile, "ADAPTIVE")) { plates_late_finish("adaptive"); return; }
+    /* A load needs positive proof that the first layer has not begun: fresh telemetry reading
+     * layer 0 of this print right now. A stream that reconnects during a print, or a count that
+     * never showed this print's 0, therefore never loads. */
+    int startup = plates_late.layer_reset && have_layer && layer < 1 && !strcmp(state, "printing");
     int slot = !strcmp(profile, plates_late.slot);
+    if (plates_late.x.fd >= 0 && !startup && plates_late.x.sent < strlen(plates_late.x.request)) {
+        plates_exchange_close(&plates_late.x); /* not sent yet: the window closed meanwhile */
+        return;
+    }
     if (plates_late.x.fd < 0) { /* a load already sent finishes even if the push about it came first */
-        if (slot && plates_late.loads >= PLATES_LATE_LOADS && now - plates_late.sent >= 5000) plates_late_finish("failed");
-        if (!slot || plates_late.loads >= PLATES_LATE_LOADS || now - plates_late.sent < 1500) return;
+        if (slot && startup && plates_late.loads >= PLATES_LATE_LOADS && now - plates_late.sent >= 5000)
+            plates_late_finish("failed");
+        if (!slot || !startup || plates_late.loads >= PLATES_LATE_LOADS || now - plates_late.sent < 1500) return;
     }
     char query[192], *reply = NULL; size_t length = 0;
     snprintf(query, sizeof(query), "{\"id\":204,\"method\":\"gcode/script\",\"params\":{\"script\":\"BED_MESH_PROFILE LOAD=%s\"}}\003",
@@ -1763,6 +1773,17 @@ static void plates_cal_end(const char *result, const char *error, const char *de
     if (plates_cal.stage) fprintf(stderr, "Bed mesh calibration at %d C: %s %s %s\n", plates_cal.temp, result, error, detail);
     plates_cal.stage = CAL_IDLE; plates_cal.result = result; plates_cal.error = error;
     snprintf(plates_cal.detail, sizeof(plates_cal.detail), "%s", detail);
+}
+
+/* NULL when probing may start: MQTT reports Idle now and fresh telemetry reads the bed at its target. */
+static const char *plates_cal_hold(const mqtt_client *mqtt, int have_bed, double bed, double target) {
+    time_t now = time(NULL);
+    if (!mqtt->connected || !mqtt->registered || !mqtt->have_machine_status || mqtt->last_message <= 0 ||
+        now < mqtt->last_message || now - mqtt->last_message > 15) return "Printer status is stale";
+    if (mqtt->machine_status != 1) return "The printer is not idle";
+    if (!have_bed) return "Bed telemetry is unavailable";
+    if (fabs(target - plates_cal.temp) > 0.5 || bed < plates_cal.temp - 1.0) return "The bed is not at the temperature";
+    return NULL;
 }
 
 static int plates_homed(const mqtt_client *mqtt) {
@@ -1862,6 +1883,19 @@ static void plates_calibration_tick(const mqtt_client *mqtt, console_state *cons
         }
         if (now < plates_cal.soak_until || busy) return; /* a command typed meanwhile finishes first */
         {
+            /* Waits up to a minute for fresh evidence, then stops; the bed is switched off only when
+             * the printer is known to be idle, so a print started meanwhile keeps its heat. */
+            const char *hold = plates_cal_hold(mqtt, have_bed, bed, target);
+            if (hold) {
+                if (!plates_cal.held) plates_cal.held = now;
+                if (now - plates_cal.held > 60000) {
+                    int stale = !strcmp(hold, "Printer status is stale") || !strcmp(hold, "Bed telemetry is unavailable");
+                    plates_cal_end("failed", stale ? "telemetry" : !strcmp(hold, "The printer is not idle") ? "busy" : "heating",
+                                   hold, !stale && idle);
+                }
+                return;
+            }
+            plates_cal.held = 0;
             char command[96];
             snprintf(command, sizeof(command), "BED_MESH_CALIBRATE PROFILE=%s BED_TEMP=%d", plate_slot(plates_cal.side),
                      plates_cal.temp);

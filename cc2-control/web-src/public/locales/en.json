@@ -80,6 +80,7 @@
   "bed.cal_cancelled": "The calibration was stopped and the bed heater switched off.",
   "bed.cal_failed_heating": "The bed did not hold the temperature, so the calibration was stopped.",
   "bed.cal_failed_busy": "The printer became busy, so the calibration was stopped.",
+  "bed.cal_failed_telemetry": "Printer status or bed telemetry stayed unavailable, so the calibration was stopped.",
   "bed.cal_failed_probing": "The printer reported an error during the calibration.",
   "bed.invalid_soak": "Use a whole soak time from 0 to 60 minutes.",
   "bed.start_a_protected_calibration_when": "Start a protected calibration when idle.",

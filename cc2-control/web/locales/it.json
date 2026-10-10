@@ -80,6 +80,7 @@
   "bed.cal_cancelled": "La calibrazione è stata interrotta e il riscaldamento del piatto spento.",
   "bed.cal_failed_heating": "Il piatto non ha mantenuto la temperatura, quindi la calibrazione è stata fermata.",
   "bed.cal_failed_busy": "La stampante è diventata occupata, quindi la calibrazione è stata fermata.",
+  "bed.cal_failed_telemetry": "Lo stato della stampante o la telemetria del piatto sono rimasti non disponibili, quindi la calibrazione è stata fermata.",
   "bed.cal_failed_probing": "La stampante ha segnalato un errore durante la calibrazione.",
   "bed.invalid_soak": "Usa un mantenimento intero da 0 a 60 minuti.",
   "bed.start_a_protected_calibration_when": "Avvia una calibrazione protetta a stampante inattiva.",

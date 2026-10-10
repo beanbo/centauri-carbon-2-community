@@ -80,6 +80,7 @@
   "bed.cal_cancelled": "L’étalonnage a été arrêté et la chauffe du plateau coupée.",
   "bed.cal_failed_heating": "Le plateau n’a pas tenu la température ; l’étalonnage a été arrêté.",
   "bed.cal_failed_busy": "L’imprimante est devenue occupée ; l’étalonnage a été arrêté.",
+  "bed.cal_failed_telemetry": "L’état de l’imprimante ou la télémétrie du plateau est resté indisponible ; l’étalonnage a été arrêté.",
   "bed.cal_failed_probing": "L’imprimante a signalé une erreur pendant l’étalonnage.",
   "bed.invalid_soak": "Indiquez un maintien entier de 0 à 60 minutes.",
   "bed.start_a_protected_calibration_when": "Démarrer une calibration protégée à l’arrêt.",
